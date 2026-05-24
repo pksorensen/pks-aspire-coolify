@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "product": {
+      "type": "stdio",
+      "command": "product",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}

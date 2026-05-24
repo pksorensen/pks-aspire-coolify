@@ -1,0 +1,10 @@
+# Product CLI — generated files
+.product/graph/
+.product/sessions/
+.product/checklist.md
+
+# Read-only clone of upstream product-cli — reference only, not part of this repo
+.product-cli-reference/
+
+# Gap-check JSON snapshot (regenerated on demand by `product gap check`)
+gaps.json
