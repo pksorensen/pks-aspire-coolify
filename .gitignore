@@ -8,3 +8,10 @@
 
 # Gap-check JSON snapshot (regenerated on demand by `product gap check`)
 gaps.json
+
+# .NET build artefacts
+**/bin/
+**/obj/
+*.user
+[Tt]est[Rr]esult*/
+.vs/
