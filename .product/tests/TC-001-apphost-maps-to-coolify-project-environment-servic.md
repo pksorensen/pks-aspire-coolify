@@ -2,13 +2,17 @@
 id: TC-001
 title: apphost_maps_to_coolify_project_environment_service_hierarchy
 type: scenario
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-005
   adrs:
   - ADR-001
 phase: 1
+runner: bash
+runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~DeployPhaseExitCriteria
+last-run: 2026-05-24T17:56:50.291587884+00:00
+last-run-duration: 2.4s
 ---
 
 ## Scenario

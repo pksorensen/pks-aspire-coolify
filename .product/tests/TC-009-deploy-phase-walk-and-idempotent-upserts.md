@@ -2,14 +2,16 @@
 id: TC-009
 title: deploy_phase_walk_and_idempotent_upserts
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-005
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~DeployPhaseExitCriteria
+last-run: 2026-05-24T17:56:50.291587884+00:00
+last-run-duration: 2.4s
 ---
 
 ## Purpose

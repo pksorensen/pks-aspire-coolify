@@ -2,14 +2,16 @@
 id: TC-006
 title: configure_phase_exit_criteria_diagnostics_and_no_side_effects
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-002
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ConfigurePhaseExitCriteria
+last-run: 2026-05-24T16:40:27.564681418+00:00
+last-run-duration: 2.7s
 ---
 
 ## Purpose

@@ -2,7 +2,7 @@
 id: FT-004
 title: Push phase — registry push of built images and configure-phase Coolify Private Registry upsert
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 - FT-003

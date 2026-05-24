@@ -9,6 +9,8 @@ validates:
   adrs:
   - ADR-003
 phase: 1
+runner: custom
+runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ImperativeOrchestrationV1
 ---
 
 ## Purpose

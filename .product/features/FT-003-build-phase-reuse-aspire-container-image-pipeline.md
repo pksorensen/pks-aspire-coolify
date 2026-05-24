@@ -2,7 +2,7 @@
 id: FT-003
 title: Build phase — reuse Aspire container-image pipeline with deterministic per-resource tagging
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 adrs:

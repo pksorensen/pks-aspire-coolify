@@ -2,14 +2,16 @@
 id: TC-013
 title: containerisability_filter_skip_with_warning_and_idempotency
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-009
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ContainerisabilityFilterExitCriteria
+last-run: 2026-05-24T18:31:53.860985674+00:00
+last-run-duration: 2.3s
 ---
 
 ## Purpose

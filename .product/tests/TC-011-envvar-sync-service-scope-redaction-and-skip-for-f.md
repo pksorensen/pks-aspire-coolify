@@ -2,14 +2,17 @@
 id: TC-011
 title: envvar_sync_service_scope_redaction_and_skip_for_FT008
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-007
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~EnvVarSyncExitCriteria
+runner-timeout: 120
+last-run: 2026-05-24T18:15:00.655396806+00:00
+last-run-duration: 2.3s
 ---
 
 ## Purpose

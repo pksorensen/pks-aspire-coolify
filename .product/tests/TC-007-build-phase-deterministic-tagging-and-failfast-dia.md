@@ -2,14 +2,16 @@
 id: TC-007
 title: build_phase_deterministic_tagging_and_failfast_diagnostics
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-003
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~BuildPhaseExitCriteria
+last-run: 2026-05-24T17:35:08.755238814+00:00
+last-run-duration: 2.4s
 ---
 
 ## Purpose

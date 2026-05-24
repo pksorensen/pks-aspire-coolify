@@ -2,14 +2,17 @@
 id: TC-012
 title: reference_wiring_endpoint_and_connection_string_envvars
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-008
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ReferenceWiringExitCriteria
+runner-timeout: 120
+last-run: 2026-05-24T18:23:02.706366780+00:00
+last-run-duration: 2.2s
 ---
 
 ## Purpose

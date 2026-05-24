@@ -2,7 +2,7 @@
 id: FT-009
 title: Containerisability filter — skip-with-warning pass for non-containerisable Aspire resources
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 adrs:

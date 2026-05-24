@@ -2,7 +2,7 @@
 id: FT-008
 title: Service-to-service network wiring — Aspire WithReference() edges into Coolify intra-destination env-vars
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-005
 - FT-007

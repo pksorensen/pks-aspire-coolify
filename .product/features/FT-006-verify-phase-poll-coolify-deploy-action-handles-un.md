@@ -2,7 +2,7 @@
 id: FT-006
 title: Verify phase — poll Coolify deploy-action handles until each per-service deploy completes
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 - FT-005

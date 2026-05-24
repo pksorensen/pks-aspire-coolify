@@ -2,14 +2,16 @@
 id: TC-010
 title: verify_phase_polling_terminal_outcomes_and_timeout
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-006
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~VerifyPhaseExitCriteria
+last-run: 2026-05-24T18:06:31.658930631+00:00
+last-run-duration: 2.3s
 ---
 
 ## Purpose

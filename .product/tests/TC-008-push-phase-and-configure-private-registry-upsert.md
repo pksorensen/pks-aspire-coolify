@@ -2,14 +2,16 @@
 id: TC-008
 title: push_phase_and_configure_private_registry_upsert
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-004
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~PushPhaseExitCriteria
+last-run: 2026-05-24T17:46:01.601975226+00:00
+last-run-duration: 2.4s
 ---
 
 ## Purpose

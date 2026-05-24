@@ -2,13 +2,17 @@
 id: TC-002
 title: coolify_client_version_probe_and_tolerant_deserialization
 type: scenario
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-002
   adrs:
   - ADR-002
 phase: 1
+runner: bash
+runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ConfigurePhaseExitCriteria
+last-run: 2026-05-24T16:40:27.564681418+00:00
+last-run-duration: 2.5s
 ---
 
 ## Scenario

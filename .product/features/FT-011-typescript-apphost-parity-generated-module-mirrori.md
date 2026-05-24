@@ -2,7 +2,7 @@
 id: FT-011
 title: TypeScript AppHost parity — generated module mirroring WithCoolifyDeploy / WithImageRegistry / WithCoolifyDestination / WithManagedDashboard
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 - FT-003

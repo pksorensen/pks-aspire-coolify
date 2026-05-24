@@ -2,7 +2,7 @@
 id: FT-001
 title: WithCoolifyDeploy extension and 5-phase publisher skeleton
 phase: 1
-status: planned
+status: complete
 depends-on: []
 adrs:
 - ADR-003

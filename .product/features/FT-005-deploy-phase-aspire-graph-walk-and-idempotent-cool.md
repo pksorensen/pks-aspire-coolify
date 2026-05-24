@@ -2,7 +2,7 @@
 id: FT-005
 title: Deploy phase — Aspire-graph walk and idempotent Coolify upserts with deploy trigger
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 - FT-002

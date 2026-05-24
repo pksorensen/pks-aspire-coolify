@@ -2,7 +2,7 @@
 id: FT-002
 title: Configure phase — token resolution and combined version + auth probe
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 adrs:

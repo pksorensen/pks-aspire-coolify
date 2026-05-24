@@ -2,13 +2,17 @@
 id: TC-005
 title: image_registry_push_and_coolify_pull_credential_upsert
 type: scenario
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-004
   adrs:
   - ADR-005
 phase: 1
+runner: bash
+runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~PushPhaseExitCriteria
+last-run: 2026-05-24T17:46:01.601975226+00:00
+last-run-duration: 2.4s
 ---
 
 ## Intent

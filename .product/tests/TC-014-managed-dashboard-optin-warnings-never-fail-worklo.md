@@ -2,14 +2,16 @@
 id: TC-014
 title: managed_dashboard_optin_warnings_never_fail_workload
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-010
   adrs: []
 phase: 1
-runner: custom
+runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ManagedDashboardExitCriteria
+last-run: 2026-05-24T18:42:34.143245448+00:00
+last-run-duration: 2.4s
 ---
 
 ## Purpose

@@ -2,7 +2,7 @@
 id: FT-007
 title: Secret / env-var sync — Aspire parameters and connection strings into Coolify service-scope env vars
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-002
 - FT-005

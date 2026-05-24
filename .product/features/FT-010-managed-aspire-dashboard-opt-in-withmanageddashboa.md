@@ -2,7 +2,7 @@
 id: FT-010
 title: Managed Aspire dashboard opt-in — WithManagedDashboard() deploy-time upsert
 phase: 1
-status: planned
+status: complete
 depends-on:
 - FT-001
 - FT-005
