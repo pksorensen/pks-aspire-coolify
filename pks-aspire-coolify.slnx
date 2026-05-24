@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Aspire.Hosting.Coolify/Aspire.Hosting.Coolify.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj" />
+  </Folder>
+</Solution>

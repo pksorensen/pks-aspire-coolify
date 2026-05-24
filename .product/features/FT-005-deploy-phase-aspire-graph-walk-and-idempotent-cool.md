@@ -16,6 +16,7 @@ adrs:
 tests:
 - TC-001
 - TC-009
+- TC-018
 domains:
 - aspire-publisher
 - coolify-api
@@ -286,6 +287,29 @@ matching `E_…` symbol and refuses to advance to the next phase.
    captured handle with the second call's value. Calling it zero
    times leaves the publisher with no captured destination handle,
    and the deploy phase fails fast in step 1.
+
+   **§0 amendment — `string` overload (FT-005, 2026-05-24).** Destination
+   names are not secret and rarely vary per environment; the parameter-
+   handle ceremony is overkill for the common homelab single-destination
+   case. A sibling overload `WithCoolifyDestination(this … builder,
+   string name)` accepts the literal at the call site:
+
+   ```csharp
+   builder.WithCoolifyDeploy(url, token)
+          .WithCoolifyDestination("homelab");   // smooth default
+   ```
+
+   The string overload sets `DestinationLiteralName` on the publisher
+   and clears `DestinationName`; the handle overload sets
+   `DestinationName` and clears `DestinationLiteralName`. **Last-call-
+   wins discipline holds across both overloads** — exactly one source
+   is active at deploy time. The deploy phase prefers the literal when
+   set, skipping parameter resolution entirely (a fast path that
+   removes one Aspire resolve call for the homelab user). Validation
+   errors mirror the handle overload: null → `ArgumentNullException`,
+   empty/whitespace → `ArgumentException`, called before
+   `WithCoolifyDeploy(...)` → `InvalidOperationException`. Enforced by
+   TC-018.
 
 1. **Verify a destination is configured and resolve its name.** Look
    at the publisher's captured destination handle. If

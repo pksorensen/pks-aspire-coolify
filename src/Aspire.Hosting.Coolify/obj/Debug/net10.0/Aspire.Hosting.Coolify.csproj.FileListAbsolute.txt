@@ -1,0 +1,13 @@
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.csproj.AssemblyReference.cache
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.GeneratedMSBuildEditorConfig.editorconfig
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.AssemblyInfoInputs.cache
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.AssemblyInfo.cs
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.csproj.CoreCompileInputs.cache
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.sourcelink.json
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/bin/Debug/net10.0/Aspire.Hosting.Coolify.deps.json
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/bin/Debug/net10.0/Aspire.Hosting.Coolify.dll
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/bin/Debug/net10.0/Aspire.Hosting.Coolify.pdb
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.dll
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/refint/Aspire.Hosting.Coolify.dll
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/Aspire.Hosting.Coolify.pdb
+/workspaces/agentic-live-www/projects/pks-aspire-coolify/src/Aspire.Hosting.Coolify/obj/Debug/net10.0/ref/Aspire.Hosting.Coolify.dll

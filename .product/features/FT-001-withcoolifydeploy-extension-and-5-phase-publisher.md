@@ -12,6 +12,7 @@ adrs:
 - ADR-005
 tests:
 - TC-003
+- TC-017
 domains:
 - aspire-publisher
 domains-acknowledged: {}
@@ -74,6 +75,19 @@ boundaries being honoured.
   cross-wiring, typed at the call site) and for the eventual TypeScript
   AppHost-parity feature, so it is fixed by this feature and inherited
   unchanged by FT-002+.
+
+  **§B — Extension namespace convention.** Every public `With*` extension
+  method this package exposes on `IDistributedApplicationBuilder`
+  (`WithCoolifyDeploy`, `WithImageRegistry`, `WithCoolifyDestination`,
+  `WithVerifyPolling`, `WithManagedDashboard`) is declared in the
+  **`Aspire.Hosting` namespace**, not `Aspire.Hosting.Coolify`. AppHost
+  projects already pull in `Aspire.Hosting` via implicit usings, so the
+  one-liner above resolves with no extra `using` directive — matching
+  `Aspire.Hosting.Redis` → `WithRedis()`,
+  `Aspire.Hosting.Postgres` → `WithPostgres()`, and the rest of the
+  Aspire ecosystem. Internals (`CoolifyDeployingPublisher`, `CoolifyPhase`,
+  diagnostic types, etc.) stay in `Aspire.Hosting.Coolify` — only the
+  public extension surface is hoisted. Enforced by TC-017.
 - The `aspire deploy [--environment <env>]` CLI invocation, run by
   the developer (or CI) against an AppHost that called
   `WithCoolifyDeploy(...)`. The CLI's `--environment` flag, working

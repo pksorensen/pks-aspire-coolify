@@ -2,15 +2,17 @@
 id: TC-003
 title: deploy_model_imperative_orchestration_v1
 type: exit-criteria
-status: unimplemented
+status: passing
 validates:
   features:
   - FT-001
   adrs:
   - ADR-003
 phase: 1
-runner: custom
-runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~ImperativeOrchestrationV1
+runner: bash
+runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~CoolifyDeployTests
+last-run: 2026-05-24T21:02:41.819910977+00:00
+last-run-duration: 2.3s
 ---
 
 ## Purpose

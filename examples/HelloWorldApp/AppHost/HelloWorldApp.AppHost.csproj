@@ -1,0 +1,16 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.2.2">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>81f09ee6-1fee-4c10-9b11-113770263600</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Aspire.Hosting.Coolify\Aspire.Hosting.Coolify.csproj" IsAspireProjectResource="false" />
+    <ProjectReference Include="..\Api\HelloWorldApp.Api.csproj" />
+  </ItemGroup>
+
+</Project>

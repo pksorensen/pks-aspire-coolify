@@ -10,8 +10,8 @@ validates:
 phase: 1
 runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~DeployPhaseExitCriteria
-last-run: 2026-05-24T17:56:50.291587884+00:00
-last-run-duration: 2.4s
+last-run: 2026-05-24T21:06:42.959575930+00:00
+last-run-duration: 2.5s
 ---
 
 ## Purpose
