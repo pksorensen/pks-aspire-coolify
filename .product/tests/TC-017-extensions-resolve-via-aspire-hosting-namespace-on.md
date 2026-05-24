@@ -10,8 +10,8 @@ validates:
 phase: 1
 runner: bash
 runner-args: dotnet test tests/Aspire.Hosting.Coolify.Tests/Aspire.Hosting.Coolify.Tests.csproj --filter FullyQualifiedName~AspireHostingNamespaceConvention
-last-run: 2026-05-24T21:02:41.819910977+00:00
-last-run-duration: 2.3s
+last-run: 2026-05-24T21:11:21.896938792+00:00
+last-run-duration: 2.2s
 ---
 
 ## Description

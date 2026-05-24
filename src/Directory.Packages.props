@@ -1,3 +1,4 @@
+<!-- Implements ADR-006: Central Package Management scope — src/ and tests/ only, examples/ opt-out by placement (v1) -->
 <Project>
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>

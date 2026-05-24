@@ -11,6 +11,7 @@ adrs:
 - ADR-002
 - ADR-003
 - ADR-004
+- ADR-006
 tests:
 - TC-014
 domains:

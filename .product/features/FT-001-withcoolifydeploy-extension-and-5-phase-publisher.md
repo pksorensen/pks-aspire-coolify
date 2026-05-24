@@ -10,9 +10,11 @@ adrs:
 - ADR-002
 - ADR-004
 - ADR-005
+- ADR-006
 tests:
 - TC-003
 - TC-017
+- TC-016
 domains:
 - aspire-publisher
 domains-acknowledged: {}

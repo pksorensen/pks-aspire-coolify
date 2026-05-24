@@ -10,6 +10,7 @@ adrs:
 - ADR-005
 - ADR-001
 - ADR-004
+- ADR-006
 tests:
 - TC-007
 domains:

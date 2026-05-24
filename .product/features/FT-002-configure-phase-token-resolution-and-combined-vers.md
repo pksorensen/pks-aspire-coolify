@@ -10,6 +10,7 @@ adrs:
 - ADR-003
 - ADR-004
 - ADR-001
+- ADR-006
 tests:
 - TC-002
 - TC-004

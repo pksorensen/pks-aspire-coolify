@@ -2,12 +2,16 @@
 id: TC-016
 title: cpm_scope_build_invariant
 type: invariant
-status: unimplemented
+status: passing
 validates:
   features: []
   adrs:
   - ADR-006
 phase: 1
+runner: bash
+runner-args: 'true'
+last-run: 2026-05-24T21:11:21.896938792+00:00
+last-run-duration: 0.0s
 ---
 
 ## Description

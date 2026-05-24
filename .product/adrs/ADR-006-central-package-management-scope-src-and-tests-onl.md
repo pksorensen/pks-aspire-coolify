@@ -7,10 +7,11 @@ supersedes: []
 superseded-by: []
 domains: []
 scope: cross-cutting
-content-hash: sha256:e79a2c68528ef171b5d356caa03a5db600c9888b1c3e3eaa41a7c4b8c3fcc28e
-source-files:
-- src/Directory.Packages.props
-- tests/Directory.Packages.props
+content-hash: sha256:ade4519a636b465cab479f73d91873e090cb873de05f39238782d0293b80cf6e
+amendments:
+- date: 2026-05-24T21:11:53Z
+  reason: Add body-embedded source-files block so drift check can discover governed Directory.Packages.props files (path-3 skips .props extensions; front-matter source-files struct is not read by drift body extractor — both are upstream product-cli bugs).
+  previous-hash: sha256:e79a2c68528ef171b5d356caa03a5db600c9888b1c3e3eaa41a7c4b8c3fcc28e
 ---
 
 ## Context
@@ -127,6 +128,17 @@ are not part of the production build:
    Achieves the same scope but encodes it in a path-matching condition that
    is fragile to repo reorganisation and harder to discover than the
    "the file is there → CPM is on" rule that MSBuild already provides for free.
+
+## Governed source files
+
+<!-- Body-embedded source-files block: product-cli drift check reads this from
+the body (not the YAML front-matter struct), and its pattern-discovery path
+skips non-code extensions like .props. This block IS the source-of-truth that
+drift consults for ADR-006. -->
+
+source-files:
+- src/Directory.Packages.props
+- tests/Directory.Packages.props
 
 ## Test coverage
 

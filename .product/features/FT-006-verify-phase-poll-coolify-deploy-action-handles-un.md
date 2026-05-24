@@ -9,14 +9,15 @@ depends-on:
 adrs:
 - ADR-002
 - ADR-003
+- ADR-006
 tests:
 - TC-010
 domains:
 - aspire-publisher
 - coolify-api
 domains-acknowledged:
-  ADR-004: FT-006 does not resolve, read, log, or transmit the Coolify bearer token. Token resolution and the auth probe are owned by FT-002 in the configure phase per ADR-004 §5; verify consumes the already-constructed ICoolifyClient instance whose HttpClient carries the resolved bearer header. FT-006 has no token-handling code path and therefore inherits ADR-004's discipline transitively without needing to link it.
   ADR-001: FT-006 does not walk the Aspire resource graph and does not interact with Coolify's destination/project/environment/service hierarchy. It consumes the deploy-action handle list FT-005 produced after the graph walk completed and polls Coolify's deploy-job status endpoint only. The Aspire-graph-to-Coolify-hierarchy mapping concern is fully discharged by FT-005 upstream; verify operates on opaque per-service handles and has no opinion on how those services map onto the hierarchy.
+  ADR-004: FT-006 does not resolve, read, log, or transmit the Coolify bearer token. Token resolution and the auth probe are owned by FT-002 in the configure phase per ADR-004 §5; verify consumes the already-constructed ICoolifyClient instance whose HttpClient carries the resolved bearer header. FT-006 has no token-handling code path and therefore inherits ADR-004's discipline transitively without needing to link it.
 ---
 
 ## Description
