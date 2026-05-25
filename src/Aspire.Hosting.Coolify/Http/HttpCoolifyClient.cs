@@ -407,18 +407,33 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             try
             {
                 // Coolify v4 auto-creates a lowercase "production" environment on project
-                // creation, but Aspire deploys default to "Production" (capitalized).
-                // Coolify treats env names case-insensitively when creating (POST with
-                // "Production" against a project that already has "production" 500s).
-                // Strategy: list envs, do case-insensitive match against requested name,
-                // only POST if no match exists.
-                var envs = await _c.SendForJsonAsync<List<EnvironmentListItem>>(
-                    HttpMethod.Get,
-                    $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments",
-                    body: null, ct)
-                    .ConfigureAwait(false);
+                // creation, but the create-listener that does it is async — a GET that
+                // races the listener will return an empty list, and a subsequent POST
+                // with the same name (case-insensitively) 500s when the listener lands.
+                // Strategy: list envs, case-insensitive match against requested name;
+                // retry the list up to a few times if the project was just created
+                // and the listener hasn't completed yet.
+                List<EnvironmentListItem>? envs = null;
+                for (var attempt = 0; attempt < 5; attempt++)
+                {
+                    envs = await _c.SendForJsonAsync<List<EnvironmentListItem>>(
+                        HttpMethod.Get,
+                        $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments",
+                        body: null, ct)
+                        .ConfigureAwait(false);
 
-                if (envs is not null)
+                    if (envs is { Count: > 0 })
+                    {
+                        break;
+                    }
+                    // Back off briefly to give Coolify's project-create listener time to
+                    // materialise the default environment. 200ms x 5 = up to 1s of wait,
+                    // which is well within an `aspire deploy` budget and far longer than
+                    // a synchronous create takes.
+                    await Task.Delay(200, ct).ConfigureAwait(false);
+                }
+
+                if (envs is { Count: > 0 })
                 {
                     var match = envs.FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase))
                         ?? envs.FirstOrDefault(e => string.Equals(e.Uuid, name, StringComparison.OrdinalIgnoreCase));
@@ -428,7 +443,9 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                     }
                 }
 
-                // Not found — create it.
+                // Genuinely no env matches → POST to create one. (Rare in v4: every
+                // project gets a default env via the listener. But preserved for older
+                // Coolify versions and for explicit non-default env names.)
                 var body = new NamedBody(name);
                 var created = await _c.SendForJsonAsync<IdResponse>(
                     HttpMethod.Post,
