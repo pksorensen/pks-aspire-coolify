@@ -68,10 +68,21 @@ public static class CoolifyBuilderExtensions
             var current = phase;
             object? requiredBy = current == CoolifyPhase.Verify ? WellKnownPipelineSteps.Deploy : null;
 
+            // FT-012: every coolify-* step must wait for Aspire's built-in
+            // process-parameters step to resolve unset AddParameter values (it does
+            // the interactive prompting). DeployPrereq depends on ProcessParameters
+            // in Aspire 13.1+, so depending on DeployPrereq is the canonical way to
+            // pull the prompt step in. The first coolify-* step (configure) needs
+            // this explicitly; later steps inherit it transitively via previousStep,
+            // but listing it on every step is defensive against re-ordering.
+            object dependsOn = previousStep is null
+                ? new[] { WellKnownPipelineSteps.DeployPrereq }
+                : new[] { previousStep, WellKnownPipelineSteps.DeployPrereq };
+
             pipeline.AddStep(
                 name: stepName,
                 action: ctx => publisher.RunPhaseAsync(current, ctx),
-                dependsOn: previousStep,
+                dependsOn: dependsOn,
                 requiredBy: requiredBy);
 
             previousStep = stepName;
