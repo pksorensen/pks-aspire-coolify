@@ -267,33 +267,70 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                // Coolify v4 (with the pksorensen/coolify#feat/api-destinations endpoints)
-                // exposes `GET /api/v1/destinations` returning a JSON array. There is no
-                // `/api/v1/destinations/{name}` form — the path param is the UUID. So we
-                // list all team-visible destinations and filter by `name` (or, as a
-                // convenience, accept that the caller may pass a UUID directly).
+                // 1. List existing destinations — caller's name may be UUID, name, or the
+                //    network name we'll have to create.
                 var list = await _c.SendForJsonAsync<List<DestinationListItem>>(
                     HttpMethod.Get, "api/v1/destinations", body: null, ct)
                     .ConfigureAwait(false);
 
-                if (list is null || list.Count == 0)
+                if (list is not null && list.Count > 0)
                 {
-                    return DestinationUpsertResult.Failure(
-                        $"No destinations visible to this token. Create one in the Coolify UI under Server -> Destinations, then call WithCoolifyDestination(\"<name-or-uuid>\").");
+                    // Match by UUID first (caller may pass UUID directly), then by name,
+                    // then by network (since for many setups name == network).
+                    var match = list.FirstOrDefault(d => string.Equals(d.Uuid, name, StringComparison.OrdinalIgnoreCase))
+                        ?? list.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase))
+                        ?? list.FirstOrDefault(d => string.Equals(d.Network, name, StringComparison.OrdinalIgnoreCase));
+
+                    if (match is not null)
+                    {
+                        return DestinationUpsertResult.Found(match.Uuid ?? name);
+                    }
                 }
 
-                // Try by UUID first (caller may pass the literal UUID), then by name.
-                var match = list.FirstOrDefault(d => string.Equals(d.Uuid, name, StringComparison.OrdinalIgnoreCase))
-                    ?? list.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+                // 2. Not found — create it. Need a server_uuid; auto-pick if exactly one.
+                var servers = await _c.SendForJsonAsync<List<ServerListItem>>(
+                    HttpMethod.Get, "api/v1/servers", body: null, ct)
+                    .ConfigureAwait(false);
 
-                if (match is null)
+                if (servers is null || servers.Count == 0)
                 {
-                    var available = string.Join(", ", list.Select(d => $"{d.Name} ({d.Uuid})"));
                     return DestinationUpsertResult.Failure(
-                        $"Destination '{name}' not found. Available: {available}.");
+                        "No Coolify servers visible to this token; cannot create destination.");
+                }
+                if (servers.Count > 1)
+                {
+                    var serverList = string.Join(", ", servers.Select(s => $"{s.Name} ({s.Uuid})"));
+                    return DestinationUpsertResult.Failure(
+                        $"Multiple Coolify servers visible ({serverList}); cannot auto-select for destination creation. " +
+                        $"Pass a destination UUID via WithCoolifyDestination(\"<uuid>\") for an existing destination, " +
+                        $"or pre-create the destination in the Coolify UI.");
                 }
 
-                return DestinationUpsertResult.Found(match.Uuid ?? name);
+                var server = servers[0];
+                if (string.IsNullOrEmpty(server.Uuid))
+                {
+                    return DestinationUpsertResult.Failure("Coolify server response missing uuid; cannot create destination.");
+                }
+
+                // 3. POST /api/v1/servers/{server_uuid}/destinations creates a new
+                //    StandaloneDocker destination. Network must match the regex
+                //    `[a-zA-Z0-9][a-zA-Z0-9._-]*`; we use the supplied `name` as the network.
+                var createBody = new DestinationCreateBody(network: name, type: "standalone");
+                using var createResp = await _c.SendRawAsync(
+                    HttpMethod.Post,
+                    $"api/v1/servers/{Uri.EscapeDataString(server.Uuid)}/destinations",
+                    body: createBody, ct)
+                    .ConfigureAwait(false);
+
+                if (!createResp.IsSuccessStatusCode)
+                {
+                    var detail = await createResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    return DestinationUpsertResult.Failure(
+                        $"Coolify returned HTTP {(int)createResp.StatusCode} creating destination '{name}' on server {server.Name ?? server.Uuid}: {detail}");
+                }
+
+                var created = await _c.ReadIdAsync(createResp, ct).ConfigureAwait(false);
+                return DestinationUpsertResult.Found(created ?? name);
             }
             catch (OperationCanceledException) { throw; }
             catch (CoolifyAuthException ex) { return DestinationUpsertResult.Failure(ex.Message); }
@@ -307,6 +344,14 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             [property: JsonPropertyName("network")] string? Network,
             [property: JsonPropertyName("type")] string? Type,
             [property: JsonPropertyName("server_uuid")] string? ServerUuid);
+
+        private sealed record ServerListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record DestinationCreateBody(
+            [property: JsonPropertyName("network")] string Network,
+            [property: JsonPropertyName("type")] string Type);
     }
 
     private sealed class HttpProjectsApi : IProjectsApi
