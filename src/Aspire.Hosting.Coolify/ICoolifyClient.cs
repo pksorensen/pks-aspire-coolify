@@ -45,6 +45,9 @@ public interface ICoolifyClient
 
     /// <summary>Service-scope env-var endpoint group (FT-007 I-2), consumed by the env-var sync hook.</summary>
     IServiceEnvVarsApi ServiceEnvVars => UnconfiguredServiceEnvVarsApi.Instance;
+
+    /// <summary>Applications endpoint group (FT-016), consumed by the prereq phase.</summary>
+    IApplicationsApi Applications => UnconfiguredApplicationsApi.Instance;
 }
 
 /// <summary>

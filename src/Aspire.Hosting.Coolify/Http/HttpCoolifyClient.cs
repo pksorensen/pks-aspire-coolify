@@ -59,6 +59,7 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         Services = new HttpServicesApi(this);
         DeployJobs = new HttpDeployJobsApi(this);
         ServiceEnvVars = new HttpServiceEnvVarsApi(this);
+        Applications = new HttpApplicationsApi(this);
     }
 
     public IPrivateRegistriesApi PrivateRegistries { get; }
@@ -68,6 +69,7 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
     public IServicesApi Services { get; }
     public IDeployJobsApi DeployJobs { get; }
     public IServiceEnvVarsApi ServiceEnvVars { get; }
+    public IApplicationsApi Applications { get; }
 
     public async Task<CoolifyProbeResult> ProbeAsync(CancellationToken cancellationToken)
     {
@@ -718,6 +720,313 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             [property: JsonPropertyName("key")] string Key,
             [property: JsonPropertyName("value")] string Value,
             [property: JsonPropertyName("secret")] bool Secret);
+    }
+
+    // Implements FT-016: HTTP-backed IApplicationsApi for the coolify-prereq phase.
+    // Provisions the in-project registry's Coolify Application + triggers/awaits its deploy.
+    private sealed class HttpApplicationsApi : IApplicationsApi
+    {
+        private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
+        private static readonly TimeSpan PollBudget = TimeSpan.FromMinutes(5);
+
+        private readonly HttpCoolifyClient _c;
+        public HttpApplicationsApi(HttpCoolifyClient c) { _c = c; }
+
+        public async Task<ApplicationProvisionResult> ProvisionRegistryAsync(
+            ApplicationProvisionRequest request, CancellationToken ct)
+        {
+            try
+            {
+                // 1. Resolve project_uuid via list-by-name idempotency, creating if absent.
+                var projects = await _c.SendForJsonAsync<List<NamedUuid>>(
+                    HttpMethod.Get, "api/v1/projects", body: null, ct).ConfigureAwait(false);
+
+                string? projectUuid = projects?
+                    .FirstOrDefault(p => string.Equals(p.Name, request.ApphostProjectName, StringComparison.OrdinalIgnoreCase))
+                    ?.Uuid;
+
+                if (string.IsNullOrEmpty(projectUuid))
+                {
+                    var created = await _c.SendForJsonAsync<IdResponse>(
+                        HttpMethod.Post, "api/v1/projects",
+                        new NamedBody(request.ApphostProjectName), ct).ConfigureAwait(false);
+                    projectUuid = created?.IdOrUuid;
+                }
+
+                if (string.IsNullOrEmpty(projectUuid))
+                {
+                    return new ApplicationProvisionResult(false, null, null, null, null,
+                        $"could not resolve or create Coolify project '{request.ApphostProjectName}'");
+                }
+
+                // 2. List existing applications and match by name for idempotency.
+                var existing = await _c.SendForJsonAsync<List<AppListItem>>(
+                    HttpMethod.Get, "api/v1/applications", body: null, ct).ConfigureAwait(false);
+
+                string? appUuid = existing?
+                    .FirstOrDefault(a => string.Equals(a.Name, request.RegistryResourceName, StringComparison.OrdinalIgnoreCase))
+                    ?.Uuid;
+
+                if (string.IsNullOrEmpty(appUuid))
+                {
+                    // 2b. Ensure the target environment exists (Coolify creates `production`
+                    // asynchronously when a project is created — the env upsert handles the race
+                    // and returns the UUID we need).
+                    var envResult = await _c.Environments
+                        .UpsertAsync(projectUuid, request.EnvironmentName, ct).ConfigureAwait(false);
+                    if (envResult.Kind == UpsertKind.Failure || string.IsNullOrEmpty(envResult.Id))
+                    {
+                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                            $"could not resolve Coolify environment '{request.EnvironmentName}' for project {projectUuid}: {envResult.ErrorMessage ?? "(no detail)"}");
+                    }
+
+                    // 3. Discover the single visible server.
+                    var servers = await _c.SendForJsonAsync<List<NamedUuid>>(
+                        HttpMethod.Get, "api/v1/servers", body: null, ct).ConfigureAwait(false);
+                    if (servers is null || servers.Count == 0)
+                    {
+                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                            "no Coolify servers visible; cannot create registry application");
+                    }
+                    if (servers.Count > 1)
+                    {
+                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                            "multiple Coolify servers visible; auto-select not supported for registry application");
+                    }
+                    var serverUuid = servers[0].Uuid;
+                    if (string.IsNullOrEmpty(serverUuid))
+                    {
+                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                            "Coolify server response missing uuid");
+                    }
+
+                    // 4. Parse `<image>:<tag>` (mirror HttpServicesApi.UpsertAsync).
+                    string imageName = request.Image, imageTag = "latest";
+                    var slashIdx = request.Image.LastIndexOf('/');
+                    var colonIdx = request.Image.LastIndexOf(':');
+                    if (colonIdx > slashIdx)
+                    {
+                        imageName = request.Image[..colonIdx];
+                        imageTag = request.Image[(colonIdx + 1)..];
+                    }
+
+                    // 4b. Resolve destination UUID when WithCoolifyDestination(literal) was set —
+                    // Coolify rejects POST /applications/dockerimage with HTTP 400 when the server
+                    // has multiple destinations and the body omits destination_uuid.
+                    string? destinationUuid = null;
+                    if (!string.IsNullOrWhiteSpace(request.DestinationName))
+                    {
+                        var destResult = await _c.Destinations
+                            .LookupOrUpsertAsync(request.DestinationName!, ct).ConfigureAwait(false);
+                        if (destResult.Kind == UpsertKind.Failure || string.IsNullOrEmpty(destResult.Id))
+                        {
+                            return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                                $"could not resolve Coolify destination '{request.DestinationName}': {destResult.ErrorMessage ?? "(no detail)"}");
+                        }
+                        destinationUuid = destResult.Id;
+                    }
+
+                    var createBody = new DockerImageAppBody2(
+                        Name: request.RegistryResourceName,
+                        ProjectUuid: projectUuid,
+                        ServerUuid: serverUuid!,
+                        DestinationUuid: destinationUuid,
+                        EnvironmentUuid: envResult.Id!,
+                        DockerRegistryImageName: imageName,
+                        DockerRegistryImageTag: imageTag,
+                        PortsExposes: request.Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        InstantDeploy: false);
+
+                    using var resp = await _c.SendRawAsync(
+                        HttpMethod.Post, "api/v1/applications/dockerimage", createBody, ct)
+                        .ConfigureAwait(false);
+
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        var detail = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                            $"Coolify returned HTTP {(int)resp.StatusCode} creating registry application: {detail}");
+                    }
+                    appUuid = await _c.ReadIdAsync(resp, ct).ConfigureAwait(false);
+                }
+
+                if (string.IsNullOrEmpty(appUuid))
+                {
+                    return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                        "Coolify did not return a UUID for the registry application");
+                }
+
+                // 5. Read back the application to discover the assigned FQDN.
+                string? fqdn = null;
+                try
+                {
+                    var detail = await _c.SendForJsonAsync<AppDetailBody>(
+                        HttpMethod.Get,
+                        $"api/v1/applications/{Uri.EscapeDataString(appUuid)}",
+                        body: null, ct).ConfigureAwait(false);
+                    fqdn = NormalizeFqdn(detail?.Fqdn);
+                }
+                catch (CoolifyTransportException) { /* leave fqdn null */ }
+                catch (CoolifyUnparseableResponseException) { /* leave fqdn null */ }
+
+                return new ApplicationProvisionResult(
+                    Succeeded: true,
+                    ApplicationUuid: appUuid,
+                    PrivateRegistryUuid: null,
+                    ProjectUuid: projectUuid,
+                    AutoDiscoveredFqdn: fqdn,
+                    ErrorMessage: null);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (CoolifyAuthException ex)
+            { return new ApplicationProvisionResult(false, null, null, null, null, ex.Message); }
+            catch (CoolifyTransportException ex)
+            { return new ApplicationProvisionResult(false, null, null, null, null, ex.Message); }
+            catch (CoolifyUnparseableResponseException ex)
+            { return new ApplicationProvisionResult(false, null, null, null, null, ex.Message); }
+        }
+
+        public async Task<ApplicationDeployResult> TriggerAndAwaitAsync(
+            string applicationUuid, CancellationToken ct)
+        {
+            string? deploymentUuid = null;
+            try
+            {
+                using var startResp = await _c.SendRawAsync(
+                    HttpMethod.Post,
+                    $"api/v1/applications/{Uri.EscapeDataString(applicationUuid)}/start",
+                    body: null, ct).ConfigureAwait(false);
+
+                if (!startResp.IsSuccessStatusCode)
+                {
+                    var detail = await startResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    return new ApplicationDeployResult(false, null,
+                        $"Coolify returned HTTP {(int)startResp.StatusCode} triggering registry deploy: {detail}");
+                }
+
+                // Coolify's /start returns `{"deployment_uuid":"…"}`; tolerate `id`/`uuid` as well.
+                await using (var stream = await startResp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        var dto = await JsonSerializer.DeserializeAsync<StartResponse>(stream, JsonOptions, ct)
+                            .ConfigureAwait(false);
+                        deploymentUuid = dto?.DeploymentUuid ?? dto?.Uuid ?? dto?.Id;
+                    }
+                    catch (JsonException) { /* fall through; deploymentUuid stays null */ }
+                }
+
+                if (string.IsNullOrEmpty(deploymentUuid))
+                {
+                    return new ApplicationDeployResult(false, null,
+                        "Coolify /start did not return a deployment_uuid to poll");
+                }
+
+                // Poll /api/v1/deployments/{uuid} for a terminal status.
+                var deadline = DateTime.UtcNow + PollBudget;
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    using var poll = await _c.SendRawAsync(
+                        HttpMethod.Get,
+                        $"api/v1/deployments/{Uri.EscapeDataString(deploymentUuid)}",
+                        body: null, ct).ConfigureAwait(false);
+
+                    if (poll.IsSuccessStatusCode)
+                    {
+                        DeploymentBody? dto = null;
+                        try
+                        {
+                            await using var stream = await poll.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                            dto = await JsonSerializer.DeserializeAsync<DeploymentBody>(stream, JsonOptions, ct)
+                                .ConfigureAwait(false);
+                        }
+                        catch (JsonException) { /* treat as transient */ }
+
+                        var status = dto?.Status?.Trim().ToLowerInvariant();
+                        switch (status)
+                        {
+                            case "finished":
+                            case "success":
+                            case "succeeded":
+                            case "ok":
+                                return new ApplicationDeployResult(true, deploymentUuid, null);
+                            case "failed":
+                            case "failure":
+                            case "error":
+                            case "cancelled-by-user":
+                            case "cancelled":
+                                return new ApplicationDeployResult(false, deploymentUuid,
+                                    $"deploy-action terminal state: {status}");
+                        }
+                    }
+                    else if (poll.StatusCode != HttpStatusCode.NotFound)
+                    {
+                        // Non-404 non-success: surface immediately.
+                        return new ApplicationDeployResult(false, deploymentUuid,
+                            $"Coolify returned HTTP {(int)poll.StatusCode} polling deployment");
+                    }
+
+                    await Task.Delay(PollInterval, ct).ConfigureAwait(false);
+                }
+
+                return new ApplicationDeployResult(false, deploymentUuid,
+                    $"deploy did not reach a terminal state within {PollBudget}");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (CoolifyAuthException ex)
+            { return new ApplicationDeployResult(false, deploymentUuid, ex.Message); }
+            catch (CoolifyTransportException ex)
+            { return new ApplicationDeployResult(false, deploymentUuid, ex.Message); }
+            catch (CoolifyUnparseableResponseException ex)
+            { return new ApplicationDeployResult(false, deploymentUuid, ex.Message); }
+        }
+
+        private static string? NormalizeFqdn(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            var first = raw.Split(',')[0].Trim();
+            if (first.Length == 0) return null;
+            if (first.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                first = first["https://".Length..];
+            else if (first.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                first = first["http://".Length..];
+            var slash = first.IndexOf('/');
+            if (slash >= 0) first = first[..slash];
+            return first.Length == 0 ? null : first;
+        }
+
+        private sealed record NamedUuid(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record AppListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record DockerImageAppBody2(
+            [property: JsonPropertyName("name")] string Name,
+            [property: JsonPropertyName("project_uuid")] string ProjectUuid,
+            [property: JsonPropertyName("server_uuid")] string ServerUuid,
+            [property: JsonPropertyName("destination_uuid")] string? DestinationUuid,
+            [property: JsonPropertyName("environment_uuid")] string EnvironmentUuid,
+            [property: JsonPropertyName("docker_registry_image_name")] string DockerRegistryImageName,
+            [property: JsonPropertyName("docker_registry_image_tag")] string DockerRegistryImageTag,
+            [property: JsonPropertyName("ports_exposes")] string PortsExposes,
+            [property: JsonPropertyName("instant_deploy")] bool InstantDeploy);
+
+        private sealed record AppDetailBody(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("fqdn")] string? Fqdn);
+
+        private sealed record StartResponse(
+            [property: JsonPropertyName("deployment_uuid")] string? DeploymentUuid,
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("id")] string? Id);
+
+        private sealed record DeploymentBody(
+            [property: JsonPropertyName("status")] string? Status);
     }
 
     private async Task<string?> ReadIdAsync(HttpResponseMessage resp, CancellationToken ct)

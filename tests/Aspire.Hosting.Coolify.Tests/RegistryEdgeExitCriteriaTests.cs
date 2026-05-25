@@ -251,7 +251,7 @@ public sealed class RegistryEdgeExitCriteriaTests
         // sites).
         Assert.NotNull(publisher.ShimDefaultRegistry);
         Assert.StartsWith("coolify-legacy-", publisher.ShimDefaultRegistry!.Name);
-        var address = await CoolifyDeployingPublisher.ResolveRegistryAddressAsync(
+        var address = await CoolifyDeployingPublisher.ResolveRegistryAddressStaticAsync(
             publisher.ShimDefaultRegistry!, default);
         Assert.Equal("ghcr.io/legacy", address);
 

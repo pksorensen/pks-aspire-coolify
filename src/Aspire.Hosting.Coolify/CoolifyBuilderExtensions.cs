@@ -67,6 +67,10 @@ public static class CoolifyBuilderExtensions
             // else. Resolved lazily at filter-time so resources added after WithCoolifyDeploy()
             // are still included.
             AllResourcesProvider = () => builder.Resources,
+            // FT-016: enumerate in-project pks-agent-registry resources via the sidecar
+            // table AddPksAgentRegistry maintains (AddContainerRegistry doesn't add to
+            // builder.Resources).
+            PksAgentRegistryProvider = () => PksAgentRegistryExtensions.GetPksAgentRegistries(builder),
         };
         s_registry.Add(builder, publisher);
 

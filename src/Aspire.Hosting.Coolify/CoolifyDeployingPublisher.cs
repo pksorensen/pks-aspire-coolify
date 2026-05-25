@@ -267,6 +267,54 @@ public sealed class CoolifyDeployingPublisher
     public BuildDiagnostic? LastBuildDiagnostic { get; private set; }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // FT-016 — prereq phase state for in-project pks-agent-registry resources.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Default-implementation reachability probe (HEAD /v2/ → fallback GET /v2/). Tests
+    /// inject a deterministic fake.
+    /// </summary>
+    public IRegistryReachabilityProbe ReachabilityProbe { get; set; } =
+        DefaultRegistryReachabilityProbe.Instance;
+
+    /// <summary>Most recent prereq-phase diagnostic (null on success / no-op).</summary>
+    public PrereqDiagnostic? LastPrereqDiagnostic { get; private set; }
+
+    /// <summary>
+    /// Per-registry state collected during the prereq phase. Keyed by the
+    /// <see cref="ContainerRegistryResource.Name"/> of the registry-target resource.
+    /// Bounded by the AppHost process lifetime (FT-016 §State / I-10).
+    /// </summary>
+    internal readonly Dictionary<string, PksAgentRegistryState> _prereqState =
+        new(StringComparer.Ordinal);
+
+    /// <summary>Public read-only accessor for tests / downstream phases.</summary>
+    public IReadOnlyDictionary<string, PksAgentRegistryState> PrereqStateByRegistry => _prereqState;
+
+    /// <summary>
+    /// Workload-name → in-project-registry-UUID attachment map (FT-016 §"Behaviour §5").
+    /// Populated by the prereq phase; consumed by the deploy phase when emitting workload
+    /// Application bodies (I-5).
+    /// </summary>
+    internal readonly Dictionary<string, string> _workloadPrivateRegistryAttachment =
+        new(StringComparer.Ordinal);
+
+    public IReadOnlyDictionary<string, string> WorkloadPrivateRegistryAttachment
+        => _workloadPrivateRegistryAttachment;
+
+    /// <summary>Number of in-project registries visited by the most recent prereq run (TC-032 / TC-034).</summary>
+    public int LastPrereqVisitedCount { get; private set; }
+
+    /// <summary>
+    /// Source of in-project pks-agent-registry resources the prereq phase walks. Populated
+    /// by <c>WithCoolifyDeploy</c> from the per-builder lookup that
+    /// <see cref="PksAgentRegistryExtensions.AddPksAgentRegistry"/> maintains. Tests
+    /// override directly.
+    /// </summary>
+    public Func<IEnumerable<ContainerRegistryResource>>? PksAgentRegistryProvider { get; set; }
+
+
+    // ──────────────────────────────────────────────────────────────────────────
     // FT-004 — push phase state.
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -469,6 +517,18 @@ public sealed class CoolifyDeployingPublisher
                     ok = true;
                     break;
 
+                case CoolifyPhase.Prereq:
+                    var prereqOutcome = await RunPrereqAsync(ct).ConfigureAwait(false);
+                    if (!prereqOutcome.Succeeded)
+                    {
+                        var d = prereqOutcome.Diagnostic!;
+                        log.LogError("coolify: prereq: {Symbol} registry={Registry} project={Project} app={App} deploy={Deploy} fqdn={Fqdn} detail={Detail}",
+                            d.Symbol, d.Registry, d.ProjectUuid, d.ApplicationUuid, d.DeployActionUuid, d.Fqdn, d.Detail);
+                        throw new CoolifyPrereqFailedException(d);
+                    }
+                    ok = true;
+                    break;
+
                 case CoolifyPhase.Build:
                     var resources = ResourcesToBuild?.Invoke()
                         ?? (LastFilterSummary?.Containerisable as IEnumerable<IResource>)
@@ -476,7 +536,10 @@ public sealed class CoolifyDeployingPublisher
                     var buildOutcome = await RunBuildAsync(resources, log, ct).ConfigureAwait(false);
                     if (!buildOutcome.Succeeded)
                     {
-                        throw new CoolifyBuildFailedException(buildOutcome.Diagnostic!);
+                        var bd = buildOutcome.Diagnostic!;
+                        log.LogError("coolify: build: {Symbol} resource={Resource} detail={Detail}",
+                            bd.Symbol, bd.Resource, bd.Detail);
+                        throw new CoolifyBuildFailedException(bd);
                     }
                     ok = true;
                     break;
@@ -697,22 +760,20 @@ public sealed class CoolifyDeployingPublisher
         {
             // Materialise the resource set once so we can pre-walk it for the
             // registry-edge gate without re-enumerating a stateful provider.
-            var resourceList = resources.ToList();
+            // FT-016: skip pks-agent-registry containers — they're deployed by the prereq
+            // phase, not built/pushed as workloads.
+            var resourceList = resources
+                .Where(r => !r.Annotations.OfType<PksAgentRegistryAnnotation>().Any())
+                .ToList();
 
-            // FT-014 §A: verify every workload that needs to be BUILT has a registry
-            // edge. Resources that reference a pre-existing image (AddContainer without
-            // IProjectMetadata) don't need building, don't need pushing, and therefore
-            // don't need a registry edge — Coolify can pull their image directly from
-            // wherever it's hosted (Docker Hub, GHCR, etc.). This is the same heuristic
-            // the build pipeline already uses to no-op for non-project resources.
+            // FT-014 §A: verify every workload has a registry edge (explicit annotation
+            // or shim default). FT-016 relaxes nothing here — the pks-agent in-project
+            // path still requires a workload→registry edge; ResolveRegistryFor returns
+            // that registry and ResolveRegistryAddressAsync substitutes the
+            // prereq-resolved FQDN at iteration time (I-3 / TC-035).
             var unattached = new List<string>();
             foreach (var resource in resourceList)
             {
-                var needsBuild = resource.Annotations.OfType<IProjectMetadata>().Any();
-                if (!needsBuild)
-                {
-                    continue; // pre-existing image — no registry edge required
-                }
                 if (ResolveRegistryFor(resource) is null)
                 {
                     unattached.Add(resource.Name);
@@ -747,15 +808,6 @@ public sealed class CoolifyDeployingPublisher
             foreach (var resource in resourceList)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-
-                // Pre-existing-image resources (AddContainer) don't need build/tag/push —
-                // skip the same way the registry-edge gate does. Their image annotation
-                // already names a real, pullable image; deploy phase will tell Coolify
-                // about it directly.
-                if (!resource.Annotations.OfType<IProjectMetadata>().Any())
-                {
-                    continue;
-                }
 
                 var registry = ResolveRegistryFor(resource)!;
                 var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
@@ -959,6 +1011,238 @@ public sealed class CoolifyDeployingPublisher
     }
 
     /// <summary>
+    /// FT-016 prereq-phase body. Enumerates every in-project pks-agent-registry resource
+    /// reachable from the AppHost resource graph (those carrying a
+    /// <see cref="PksAgentRegistryAnnotation"/>) and, for each, upserts the Coolify
+    /// Application, triggers its deploy, resolves the FQDN (auto-discovery or
+    /// <c>WithDomain(...)</c> escape hatch), probes <c>/v2/</c> for reachability, and
+    /// records the assigned Private-Registry UUID for sibling-workload attachment.
+    /// </summary>
+    /// <remarks>
+    /// I-2: when zero registries carry the annotation, the phase is a structured no-op
+    /// (zero Coolify calls, zero state mutation). I-1 / I-6 / I-7: any failure throws via
+    /// <see cref="CoolifyPrereqFailedException"/> so <c>coolify-build</c> never runs.
+    /// </remarks>
+    public async Task<PrereqOutcome> RunPrereqAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        _prereqState.Clear();
+        _workloadPrivateRegistryAttachment.Clear();
+        LastPrereqDiagnostic = null;
+        LastPrereqVisitedCount = 0;
+
+        // I-2: enumerate in-project registries via the sidecar lookup maintained by
+        // AddPksAgentRegistry (Aspire's AddContainerRegistry doesn't register the resource
+        // on builder.Resources, so we keep a separate per-builder table).
+        var allResources = AllResourcesProvider?.Invoke() ?? Array.Empty<IResource>();
+        var registryCandidates = PksAgentRegistryProvider?.Invoke()
+            ?? Array.Empty<ContainerRegistryResource>();
+        var registries = new List<(ContainerRegistryResource Registry, PksAgentRegistryAnnotation Marker)>();
+        foreach (var registry in registryCandidates)
+        {
+            var marker = registry.Annotations.OfType<PksAgentRegistryAnnotation>().FirstOrDefault();
+            if (marker is null) continue;
+            registries.Add((registry, marker));
+        }
+
+        if (registries.Count == 0)
+        {
+            return PrereqOutcome.SkippedNoRegistries();
+        }
+
+        var client = ResolvedClient
+            ?? ClientFactory.Create(string.Empty, string.Empty);
+
+        var apphostName = AppHostInfoProvider().AssemblyName;
+        var environmentName = ActiveEnvironmentProvider();
+
+        foreach (var (registry, marker) in registries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            LastPrereqVisitedCount++;
+
+            var state = new PksAgentRegistryState
+            {
+                RegistryResourceName = registry.Name,
+            };
+            _prereqState[registry.Name] = state;
+
+            // §3 escape hatch: pre-set domain present?
+            var preSet = registry.Annotations.OfType<PksAgentRegistryDomainAnnotation>().FirstOrDefault();
+            if (preSet is not null)
+            {
+                state.PreSetDomain = preSet.Domain;
+                // Emit the W_… warning verbatim (I-8). The phase still proceeds.
+                EmitPrereqWarning(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.RegistryFqdnFallback,
+                    Registry = registry.Name,
+                    Fqdn = preSet.Domain,
+                });
+            }
+
+            // §1 — upsert the Coolify Application for the registry.
+            ApplicationProvisionResult provision;
+            try
+            {
+                provision = await client.Applications.ProvisionRegistryAsync(
+                    new ApplicationProvisionRequest(
+                        RegistryResourceName: registry.Name,
+                        ApphostProjectName: apphostName,
+                        EnvironmentName: environmentName,
+                        Image: marker.Image,
+                        Port: marker.Port,
+                        DestinationName: DestinationLiteralName),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    Detail = ex.Message,
+                });
+            }
+
+            state.ApplicationUuid = provision.ApplicationUuid;
+            state.PrivateRegistryUuid = provision.PrivateRegistryUuid;
+            state.ProjectUuid = provision.ProjectUuid;
+
+            if (!provision.Succeeded)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ProjectUuid = provision.ProjectUuid,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Detail = provision.ErrorMessage,
+                });
+            }
+
+            // §2 — trigger and await the deploy-action.
+            ApplicationDeployResult deploy;
+            try
+            {
+                deploy = await client.Applications
+                    .TriggerAndAwaitAsync(provision.ApplicationUuid!, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ProjectUuid = provision.ProjectUuid,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Detail = ex.Message,
+                });
+            }
+
+            state.DeployActionUuid = deploy.DeployActionUuid;
+            if (!deploy.Succeeded)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ProjectUuid = provision.ProjectUuid,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    DeployActionUuid = deploy.DeployActionUuid,
+                    Detail = deploy.ErrorMessage,
+                });
+            }
+
+            // §3 — resolve FQDN: pre-set escape hatch wins, otherwise auto-discovered.
+            var fqdn = state.PreSetDomain ?? provision.AutoDiscoveredFqdn;
+            if (string.IsNullOrWhiteSpace(fqdn))
+            {
+                // Auto-discovery yielded no domain; surface as unreachable so the user
+                // sees a concrete diagnostic naming the registry.
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryUnreachable,
+                    Registry = registry.Name,
+                    ProjectUuid = provision.ProjectUuid,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Fqdn = "(none)",
+                    Detail = "Coolify did not report an assigned domain for this Application",
+                });
+            }
+            state.ResolvedFqdn = fqdn;
+
+            // §4 — probe /v2/ for reachability.
+            RegistryProbeOutcome probe;
+            try
+            {
+                probe = await ReachabilityProbe.ProbeAsync(fqdn, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryUnreachable,
+                    Registry = registry.Name,
+                    Fqdn = fqdn,
+                    ProbeUrl = $"https://{fqdn}/v2/",
+                    Detail = ex.Message,
+                });
+            }
+            if (!probe.Succeeded)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryUnreachable,
+                    Registry = registry.Name,
+                    Fqdn = fqdn,
+                    ProbeUrl = probe.ProbeUrl,
+                    Elapsed = probe.Elapsed,
+                    Detail = probe.LastNetworkError,
+                });
+            }
+        }
+
+        // §5 — record per-workload attachment map from the resource graph's
+        // workload→registry edges. Use both the standard resource graph and any
+        // resources supplied via ResourcesToBuild (which may include test-only
+        // FakeProject resources that aren't enumerated in builder.Resources).
+        var attachmentSources = (ResourcesToBuild?.Invoke() ?? Array.Empty<IResource>())
+            .Concat(allResources);
+        foreach (var resource in attachmentSources)
+        {
+            var edge = resource.Annotations.OfType<ContainerRegistryReferenceAnnotation>().FirstOrDefault();
+            if (edge?.Registry is not ContainerRegistryResource registry) continue;
+            if (!_prereqState.TryGetValue(registry.Name, out var state)) continue;
+            if (string.IsNullOrEmpty(state.PrivateRegistryUuid)) continue;
+            _workloadPrivateRegistryAttachment[resource.Name] = state.PrivateRegistryUuid!;
+        }
+
+        return PrereqOutcome.Ok();
+    }
+
+    private PrereqOutcome EmitAndReturnPrereq(PrereqDiagnostic diagnostic)
+    {
+        LastPrereqDiagnostic = diagnostic;
+        ErrorWriter.Write(diagnostic.Format());
+        ErrorWriter.Flush();
+        return PrereqOutcome.Fail(diagnostic);
+    }
+
+    private void EmitPrereqWarning(PrereqDiagnostic diagnostic)
+    {
+        // Warning: written to stderr but does not halt the phase. Does not update
+        // LastPrereqDiagnostic (which tracks fail-fast diagnostics only).
+        ErrorWriter.Write(diagnostic.Format());
+        ErrorWriter.Flush();
+    }
+
+    /// <summary>
     /// FT-014: collect the distinct set of <see cref="ContainerRegistryResource"/>s reachable
     /// from the supplied workloads' registry edges, plus the shim default registry if the
     /// <c>WithImageRegistry(...)</c> shim was called. Workloads contribute their explicit edge
@@ -1008,8 +1292,23 @@ public sealed class CoolifyDeployingPublisher
 
     /// <summary>
     /// FT-014: resolve a registry resource's address — endpoint + optional repository path.
+    /// FT-016: for in-project pks-agent-registry resources whose prereq phase has resolved
+    /// an FQDN, that FQDN takes precedence so workload tags carry the real Coolify-assigned
+    /// host (I-3 / TC-035).
     /// </summary>
-    internal static async Task<string> ResolveRegistryAddressAsync(
+    internal async Task<string> ResolveRegistryAddressAsync(
+        ContainerRegistryResource registry,
+        CancellationToken cancellationToken)
+    {
+        if (_prereqState.TryGetValue(registry.Name, out var state)
+            && !string.IsNullOrEmpty(state.ResolvedFqdn))
+        {
+            return state.ResolvedFqdn!;
+        }
+        return await ResolveRegistryAddressStaticAsync(registry, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static async Task<string> ResolveRegistryAddressStaticAsync(
         ContainerRegistryResource registry,
         CancellationToken cancellationToken)
     {
@@ -1065,9 +1364,8 @@ public sealed class CoolifyDeployingPublisher
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // Pre-existing-image resources (AddContainer) don't need pushing — same
-                // skip as build phase. They reference an already-pullable image.
-                if (!resource.Annotations.OfType<IProjectMetadata>().Any())
+                // FT-016: skip pks-agent-registry containers — deployed by the prereq phase.
+                if (resource.Annotations.OfType<PksAgentRegistryAnnotation>().Any())
                 {
                     continue;
                 }
@@ -1387,6 +1685,12 @@ public sealed class CoolifyDeployingPublisher
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // FT-016: skip pks-agent-registry containers — deployed by the prereq phase.
+                if (resource.Annotations.OfType<PksAgentRegistryAnnotation>().Any())
+                {
+                    continue;
+                }
+
                 _lastBuildTagsByResource.TryGetValue(resource.Name, out var tag);
                 if (string.IsNullOrEmpty(tag))
                 {
@@ -1412,10 +1716,16 @@ public sealed class CoolifyDeployingPublisher
                 var registryReference = hasRegistryCreds
                     ? $"{ResolveHostFromTag(tag)}|registry"
                     : null;
+                // FT-016 I-5: workloads attached to an in-project pks-agent-registry carry
+                // the Private-Registry UUID assigned by the prereq phase.
+                _workloadPrivateRegistryAttachment.TryGetValue(resource.Name, out var prereqAttachmentUuid);
                 var spec = new ServiceSpec(
                     Image: tag,
                     RegistryReference: registryReference,
-                    DestinationBinding: destinationId);
+                    DestinationBinding: destinationId)
+                {
+                    PrivateRegistryAttachmentUuid = prereqAttachmentUuid,
+                };
 
                 ServiceUpsertResult svcResult;
                 try

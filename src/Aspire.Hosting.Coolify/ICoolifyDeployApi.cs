@@ -90,7 +90,16 @@ public sealed record EnvironmentUpsertResult(
 /// <c>destination-binding</c> are managed in v1; unmanaged fields are absent from PATCH
 /// payloads entirely (I-4).
 /// </summary>
-public sealed record ServiceSpec(string Image, string? RegistryReference, string DestinationBinding);
+public sealed record ServiceSpec(string Image, string? RegistryReference, string DestinationBinding)
+{
+    /// <summary>
+    /// FT-016 I-5: Coolify Private-Registry UUID attachment for sibling workloads whose
+    /// <c>WithContainerRegistry(...)</c> edge points at an in-project pks-agent-registry.
+    /// Null for workloads attached to external registries; set by the deploy phase based on
+    /// the UUID recorded by the prereq phase.
+    /// </summary>
+    public string? PrivateRegistryAttachmentUuid { get; init; }
+}
 
 /// <summary>
 /// FT-005's per-resource service endpoint group. The Aspire-resource-kind → Coolify-resource-

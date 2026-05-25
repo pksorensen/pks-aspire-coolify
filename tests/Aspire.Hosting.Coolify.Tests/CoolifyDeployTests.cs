@@ -88,7 +88,7 @@ public class CoolifyDeployTests
                           .ToArray();
 
         Assert.Equal(
-            new[] { "configure", "build", "push", "deploy", "verify" },
+            new[] { "configure", "prereq", "build", "push", "deploy", "verify" },
             ordered);
     }
 
