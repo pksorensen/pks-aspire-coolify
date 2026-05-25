@@ -475,19 +475,84 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                var body = new ServiceBody(
-                    resourceName, spec.Image, spec.RegistryReference, spec.DestinationBinding);
+                // Coolify v4 uses /api/v1/applications/dockerimage for image-based workloads
+                // — NOT a per-project/per-env services subpath. See routes/api.php line 117 in
+                // coollabsio/coolify. Body fields required by ApplicationsController::create_application:
+                //   project_uuid (req), server_uuid (req), destination_uuid, environment_uuid|name,
+                //   name, docker_registry_image_name, docker_registry_image_tag, ports_exposes
+                //
+                // 1. Look up existing application with this name to make the upsert idempotent.
+                var existing = await _c.SendForJsonAsync<List<AppListItem>>(
+                    HttpMethod.Get, "api/v1/applications", body: null, ct)
+                    .ConfigureAwait(false);
+
+                if (existing is not null)
+                {
+                    var match = existing.FirstOrDefault(a => string.Equals(a.Name, resourceName, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null && !string.IsNullOrEmpty(match.Uuid))
+                    {
+                        return ServiceUpsertResult.Unchanged(match.Uuid);
+                    }
+                }
+
+                // 2. Need a server_uuid. List servers and auto-pick if exactly one — matches
+                //    the destination-create flow's discovery.
+                var servers = await _c.SendForJsonAsync<List<ServerListItem2>>(
+                    HttpMethod.Get, "api/v1/servers", body: null, ct)
+                    .ConfigureAwait(false);
+                if (servers is null || servers.Count == 0)
+                {
+                    return ServiceUpsertResult.Failure("No Coolify servers visible; cannot create application.");
+                }
+                if (servers.Count > 1)
+                {
+                    return ServiceUpsertResult.Failure(
+                        "Multiple Coolify servers visible; auto-select not supported for application creation. " +
+                        "Single-server homelab setups work; multi-server needs an explicit WithCoolifyServer.");
+                }
+                var serverUuid = servers[0].Uuid;
+                if (string.IsNullOrEmpty(serverUuid))
+                {
+                    return ServiceUpsertResult.Failure("Coolify server response missing uuid.");
+                }
+
+                // 3. Parse image tag `<registry>/<name>:<tag>` into (name, tag) for the body.
+                //    Last colon separates tag from name (registry hostnames don't contain colons
+                //    in the rightmost segment after a `/`).
+                string imageName = spec.Image, imageTag = "latest";
+                var slashIdx = spec.Image.LastIndexOf('/');
+                var colonIdx = spec.Image.LastIndexOf(':');
+                if (colonIdx > slashIdx)
+                {
+                    imageName = spec.Image[..colonIdx];
+                    imageTag = spec.Image[(colonIdx + 1)..];
+                }
+
+                var createBody = new DockerImageAppBody(
+                    Name: resourceName,
+                    ProjectUuid: projectId,
+                    ServerUuid: serverUuid!,
+                    DestinationUuid: spec.DestinationBinding,
+                    EnvironmentUuid: environmentId,
+                    DockerRegistryImageName: imageName,
+                    DockerRegistryImageTag: imageTag,
+                    PortsExposes: "80",
+                    InstantDeploy: false);
+
                 using var resp = await _c.SendRawAsync(
                     HttpMethod.Post,
-                    $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments/{Uri.EscapeDataString(environmentId)}/services",
-                    body, ct).ConfigureAwait(false);
+                    "api/v1/applications/dockerimage",
+                    createBody, ct).ConfigureAwait(false);
+
                 if (resp.IsSuccessStatusCode)
                 {
                     var id = await _c.ReadIdAsync(resp, ct).ConfigureAwait(false) ?? resourceName;
                     return ServiceUpsertResult.Created(id);
                 }
+
+                var detail = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                 return ServiceUpsertResult.Failure(
-                    $"Coolify returned HTTP {(int)resp.StatusCode} upserting service.");
+                    $"Coolify returned HTTP {(int)resp.StatusCode} creating application: {detail}");
             }
             catch (OperationCanceledException) { throw; }
             catch (CoolifyAuthException ex) { return ServiceUpsertResult.Failure(ex.Message); }
@@ -495,13 +560,35 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             catch (CoolifyUnparseableResponseException ex) { return ServiceUpsertResult.Failure(ex.Message); }
         }
 
+        private sealed record AppListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record ServerListItem2(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record DockerImageAppBody(
+            [property: JsonPropertyName("name")] string Name,
+            [property: JsonPropertyName("project_uuid")] string ProjectUuid,
+            [property: JsonPropertyName("server_uuid")] string ServerUuid,
+            [property: JsonPropertyName("destination_uuid")] string? DestinationUuid,
+            [property: JsonPropertyName("environment_uuid")] string EnvironmentUuid,
+            [property: JsonPropertyName("docker_registry_image_name")] string DockerRegistryImageName,
+            [property: JsonPropertyName("docker_registry_image_tag")] string DockerRegistryImageTag,
+            [property: JsonPropertyName("ports_exposes")] string PortsExposes,
+            [property: JsonPropertyName("instant_deploy")] bool InstantDeploy);
+
         public async Task<DeployTriggerResult> TriggerDeployAsync(string serviceId, CancellationToken ct)
         {
             try
             {
+                // Coolify v4 trigger endpoint for image-based applications is
+                //   POST /api/v1/applications/{uuid}/start  (see routes/api.php line 134).
+                // Not /api/v1/services/{id}/deploy — that path doesn't exist.
                 using var resp = await _c.SendRawAsync(
                     HttpMethod.Post,
-                    $"api/v1/services/{Uri.EscapeDataString(serviceId)}/deploy",
+                    $"api/v1/applications/{Uri.EscapeDataString(serviceId)}/start",
                     body: null, ct).ConfigureAwait(false);
                 if (resp.IsSuccessStatusCode)
                 {

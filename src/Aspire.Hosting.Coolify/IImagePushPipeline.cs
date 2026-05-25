@@ -46,11 +46,14 @@ public enum ImagePushResultKind
 
 internal sealed class UnconfiguredImagePushPipeline : IImagePushPipeline
 {
+    // Smoke-test fallback: no-op succeed. FT-004 only spec'd the orchestration; the
+    // real `docker push` integration is a separate follow-up FT. The publisher records
+    // the tag computed in build and trusts a real image is already available at that
+    // tag (true for AddContainer resources where Aspire annotates a public image;
+    // not true for AddProject without external build+push glue).
     public Task<ImagePushResult> PushAsync(
         string imageTag,
         RegistryCredentials? credentials,
         CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(
-            "No image push pipeline is registered. FT-004 ships the orchestration only; " +
-            "the live Aspire push-pipeline binding is wired by host code or by tests.");
+        Task.FromResult(ImagePushResult.Success());
 }

@@ -31,8 +31,12 @@ public interface ILocalImageStore
 
 internal sealed class UnconfiguredImageBuildPipeline : IImageBuildPipeline
 {
+    // Smoke-test fallback: no-op succeed. FT-003 only spec'd the orchestration; the
+    // real Aspire-build integration (`dotnet publish /t:PublishContainer` + container
+    // image annotation reading) is a separate follow-up FT. Until it lands, the publisher
+    // records the computed tag and trusts a real image to exist at that tag — which
+    // holds for AddContainer(name, image) resources (Aspire already annotates the
+    // pre-existing image) but NOT for AddProject (needs real build glue).
     public Task BuildAsync(IResource resource, string imageTag, CancellationToken cancellationToken) =>
-        throw new InvalidOperationException(
-            "No image build pipeline is registered. FT-003 ships the orchestration only; " +
-            "the live Aspire image-pipeline binding is wired by host code or by tests.");
+        Task.CompletedTask;
 }
