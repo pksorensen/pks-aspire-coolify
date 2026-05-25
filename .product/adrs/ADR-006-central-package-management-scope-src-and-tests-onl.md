@@ -2,7 +2,8 @@
 id: ADR-006
 title: Central Package Management scope — src/ and tests/ only, examples/ opt-out by placement (v1)
 status: accepted
-features: []
+features:
+- FT-012
 supersedes: []
 superseded-by: []
 domains: []

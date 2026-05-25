@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 // Implements ADR-003: Imperative deploy orchestration with idempotent per-resource upserts (v1)
 // Implements ADR-004: Coolify auth model — bearer token via Aspire secret parameters, per-instance (v1)
 // Implements ADR-005: Image registry strategy — explicit publisher-push to a developer-chosen registry (v1)
+// Implements FT-012: Interactive parameter prompting in the configure phase (amends ADR-004 §5a)
 namespace Aspire.Hosting.Coolify;
 
 /// <summary>
@@ -45,6 +46,115 @@ public sealed class CoolifyDeployingPublisher
     /// to <see cref="Console.Error"/>; tests inject a <see cref="StringWriter"/>.
     /// </summary>
     public TextWriter ErrorWriter { get; set; } = Console.Error;
+
+    /// <summary>
+    /// Per-deploy interactivity + prompt surface (FT-012). When a parameter handle resolves to
+    /// an empty value, the publisher calls <see cref="IParameterPrompter.PromptAsync"/> iff
+    /// <see cref="IParameterPrompter.IsInteractive"/> is true; otherwise the matching
+    /// <c>E_…</c> fail-fast symbol fires verbatim (I-1). Defaults to the CI-safe
+    /// <see cref="NonInteractivePrompter"/>; host wiring (or tests) substitutes a real
+    /// Aspire-bound prompter.
+    /// </summary>
+    public IParameterPrompter Prompter { get; set; } = NonInteractivePrompter.Instance;
+
+    // FT-012 I-3 cache: at most one prompt per parameter per deploy invocation. Keyed by
+    // parameter name (the only stable handle across phases). A value of "" means "resolved to
+    // empty and confirmed unset" — the matching E_… symbol is appropriate.
+    private readonly Dictionary<string, string?> _resolvedParameterValues =
+        new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// FT-012 helper: resolve a parameter handle through Aspire's standard mechanism; if the
+    /// value is null or empty AND <see cref="IParameterPrompter.IsInteractive"/> is true,
+    /// request the canonical Aspire parameter prompt and consume its reply. Caches the result
+    /// per parameter name for the duration of the deploy invocation (I-3).
+    /// </summary>
+    /// <returns>The resolved (or prompted) value, or <c>null</c> when the parameter remains
+    /// unset — caller emits the matching <c>E_…</c> symbol.</returns>
+    /// <remarks>
+    /// FT-012 §"Error handling": a faulting prompt subsystem is treated as non-interactive
+    /// (return null → matching E_…), so the CI contract is preserved over the
+    /// degenerate-host case. <see cref="OperationCanceledException"/> propagates verbatim so
+    /// the FT-001 cancellation diagnostic fires instead of an <c>E_…</c> symbol.
+    /// </remarks>
+    internal async Task<string?> ResolveOrPromptAsync(
+        IResourceBuilder<ParameterResource> handle,
+        bool isSecret,
+        CancellationToken cancellationToken)
+    {
+        var name = handle.Resource.Name;
+
+        // FT-012 I-3: re-use the value resolved earlier in this deploy invocation.
+        if (_resolvedParameterValues.TryGetValue(name, out var cached))
+        {
+            return cached;
+        }
+
+        string? value = null;
+        try
+        {
+            value = await handle.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Aspire parameter-resolution failure is "unset" — fall through to the
+            // interactive branch (I-4) or to the matching E_… on the non-interactive branch.
+            value = null;
+        }
+
+        value = value?.Trim();
+        if (!string.IsNullOrEmpty(value))
+        {
+            _resolvedParameterValues[name] = value;
+            return value;
+        }
+
+        // FT-012 I-4: prompt branch fires only when interactivity is true AND value is empty.
+        var prompter = Prompter;
+        if (!prompter.IsInteractive)
+        {
+            _resolvedParameterValues[name] = null;
+            return null;
+        }
+
+        string? reply;
+        try
+        {
+            reply = await prompter
+                .PromptAsync(new ParameterPromptRequest(name, isSecret), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation propagates per FT-012 §Behaviour: cancellation is the user
+            // actively aborting, not "value is absent" — FT-001 cancellation diagnostic
+            // fires, not an E_… symbol.
+            throw;
+        }
+        catch
+        {
+            // Aspire prompt subsystem itself faulted — treat as non-interactive (CI-safe
+            // default per FT-012 §"Error handling").
+            _resolvedParameterValues[name] = null;
+            return null;
+        }
+
+        reply = reply?.Trim();
+        if (string.IsNullOrEmpty(reply))
+        {
+            // Empty reply: per FT-012 §Behaviour "user pressed Enter on a blank prompt" →
+            // treat as unset → matching E_… symbol.
+            _resolvedParameterValues[name] = null;
+            return null;
+        }
+
+        _resolvedParameterValues[name] = reply;
+        return reply;
+    }
 
     /// <summary>
     /// On a successful configure phase, the <see cref="ICoolifyClient"/> handed to subsequent
@@ -413,28 +523,11 @@ public sealed class CoolifyDeployingPublisher
         cancellationToken.ThrowIfCancellationRequested();
 
         // Step 1: resolve token (highest precedence — short-circuits before any network I/O).
-        string? tokenValue;
-        try
-        {
-            tokenValue = await Token.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception)
-        {
-            // Aspire parameter-resolution failure pertaining to the token → MISSING (FT-002
-            // §"Error handling"). The underlying message is suppressed: ParameterResource
-            // exception messages can include the parameter name and the resolution path, but
-            // not the token value itself; we still avoid forwarding the raw text to keep the
-            // diagnostic shape stable and avoid leaking resolver internals.
-            return EmitAndReturn(new ConfigureDiagnostic
-            {
-                Symbol = ConfigureSymbol.AuthTokenMissing,
-                ParameterName = Token.Resource.Name,
-            });
-        }
+        // FT-012: on the interactive-and-unset branch, ResolveOrPromptAsync fires the canonical
+        // Aspire parameter prompt; on the non-interactive-and-unset branch, the value is null
+        // and the matching E_AUTH_TOKEN_MISSING symbol fires verbatim (I-1).
+        var tokenValue = await ResolveOrPromptAsync(Token, isSecret: true, cancellationToken)
+            .ConfigureAwait(false);
 
         if (string.IsNullOrWhiteSpace(tokenValue))
         {
@@ -448,26 +541,9 @@ public sealed class CoolifyDeployingPublisher
         cancellationToken.ThrowIfCancellationRequested();
 
         // Step 2: resolve url. Failure here is precedence-equivalent to a transport failure
-        // (FT-002 §Behaviour step 2).
-        string? urlValue;
-        try
-        {
-            urlValue = await Url.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            return EmitAndReturn(new ConfigureDiagnostic
-            {
-                Symbol = ConfigureSymbol.CoolifyUnreachable,
-                ParameterName = Token.Resource.Name,
-                Url = "(unresolved)",
-                Detail = Sanitize(ex.Message, tokenValue),
-            });
-        }
+        // (FT-002 §Behaviour step 2). FT-012: prompts on interactive-and-unset.
+        var urlValue = await ResolveOrPromptAsync(Url, isSecret: false, cancellationToken)
+            .ConfigureAwait(false);
 
         if (string.IsNullOrWhiteSpace(urlValue))
         {
@@ -589,20 +665,11 @@ public sealed class CoolifyDeployingPublisher
                 });
             }
 
-            string? prefixValue;
-            try
-            {
-                prefixValue = await RegistryPrefix.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception)
-            {
-                return EmitAndReturnBuild(new BuildDiagnostic
-                {
-                    Symbol = BuildSymbol.RegistryNotConfigured,
-                });
-            }
-            prefixValue = prefixValue?.Trim();
+            // FT-012: prompt for the registry-prefix value when the deploy is interactive
+            // and the parameter is unset; the build phase consumes the prompted value as its
+            // image-prefix (TC-019 §3). Non-interactive fail-fast preserved (TC-020 §4).
+            var prefixValue = await ResolveOrPromptAsync(RegistryPrefix, isSecret: false, cancellationToken)
+                .ConfigureAwait(false);
             if (string.IsNullOrEmpty(prefixValue))
             {
                 return EmitAndReturnBuild(new BuildDiagnostic
@@ -720,22 +787,11 @@ public sealed class CoolifyDeployingPublisher
             });
         }
 
-        // Resolve prefix → derive host.
-        string? prefixValue;
-        try
-        {
-            prefixValue = await RegistryPrefix.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            return EmitAndReturnUpsert(new PushDiagnostic
-            {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Detail = ex.Message,
-            });
-        }
-        prefixValue = prefixValue?.Trim();
+        // FT-012: prompt for the registry-prefix value when the deploy is interactive and
+        // the parameter is unset. The cache (I-3) guarantees subsequent build/push phases
+        // reuse this value without a second prompt.
+        var prefixValue = await ResolveOrPromptAsync(RegistryPrefix, isSecret: false, cancellationToken)
+            .ConfigureAwait(false);
         if (string.IsNullOrEmpty(prefixValue))
         {
             // No prefix configured → FT-003 will surface E_REGISTRY_NOT_CONFIGURED at build.
@@ -1017,21 +1073,9 @@ public sealed class CoolifyDeployingPublisher
         }
         else
         {
-            try
-            {
-                destinationValue = await DestinationName.Resource.GetValueAsync(cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                return EmitAndReturnDeploy(new DeployDiagnostic
-                {
-                    Symbol = DeploySymbol.CoolifyDestinationUpsertFailed,
-                    Detail = ex.Message,
-                });
-            }
-            destinationValue = destinationValue?.Trim();
+            // FT-012: prompt for the destination-name value when interactive and unset.
+            destinationValue = await ResolveOrPromptAsync(DestinationName, isSecret: false, cancellationToken)
+                .ConfigureAwait(false);
             if (string.IsNullOrEmpty(destinationValue))
             {
                 return EmitAndReturnDeploy(new DeployDiagnostic
@@ -1598,25 +1642,10 @@ public sealed class CoolifyDeployingPublisher
                 return;
             }
 
-            // §2 — resolve the dashboard token. Failure → W_DASHBOARD_TOKEN_MISSING.
-            string? dashboardTokenValue;
-            try
-            {
-                dashboardTokenValue = await DashboardToken.Resource
-                    .GetValueAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception)
-            {
-                EmitDashboardWarning(new DashboardDiagnostic
-                {
-                    Symbol = DashboardSymbol.DashboardTokenMissing,
-                    Project = projectName,
-                    Environment = environmentName,
-                    ParameterName = DashboardToken.Resource.Name,
-                });
-                return;
-            }
+            // §2 — resolve the dashboard token. FT-012: prompts on interactive-and-unset
+            // for the dashboard-token secret parameter. Failure → W_DASHBOARD_TOKEN_MISSING.
+            var dashboardTokenValue = await ResolveOrPromptAsync(
+                DashboardToken, isSecret: true, cancellationToken).ConfigureAwait(false);
 
             if (string.IsNullOrWhiteSpace(dashboardTokenValue))
             {
@@ -1629,7 +1658,7 @@ public sealed class CoolifyDeployingPublisher
                 });
                 return;
             }
-            dashboardTokenValue = dashboardTokenValue.Trim();
+            // (already trimmed by ResolveOrPromptAsync)
 
             // Resolve the Coolify base URL (env-var COOLIFY_API_URL value). Best-effort: a
             // resolution failure here is unusual (configure-phase already resolved it) and
