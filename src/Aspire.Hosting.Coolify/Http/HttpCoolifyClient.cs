@@ -73,16 +73,46 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
     {
         try
         {
-            var result = await SendForJsonAsync<VersionResponse>(
+            // Coolify v4 returns the version as a bare string ("4.0.0-beta.470") with
+            // Content-Type: text/html. ADR-002 §"tolerant deserialization": accept both
+            // the bare-string shape AND a forward-compatible {"version":"x"} JSON shape
+            // in case the surface evolves.
+            using var response = await SendRawAsync(
                 HttpMethod.Get, "api/v1/version", body: null, cancellationToken)
                 .ConfigureAwait(false);
 
-            if (result is null || string.IsNullOrEmpty(result.Version))
+            if (!response.IsSuccessStatusCode)
+            {
+                throw TransportFromStatus(response.StatusCode, "api/v1/version");
+            }
+
+            var raw = (await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+            if (string.IsNullOrEmpty(raw))
+            {
+                return CoolifyProbeResult.UnparseableResponse("empty response from /api/v1/version");
+            }
+
+            string? version = null;
+            if (raw.StartsWith('{'))
+            {
+                try
+                {
+                    var parsed = JsonSerializer.Deserialize<VersionResponse>(raw, JsonOptions);
+                    version = parsed?.Version;
+                }
+                catch (JsonException)
+                {
+                    // Fall through — try as plain text.
+                }
+            }
+            version ??= raw.Trim('"');
+
+            if (string.IsNullOrEmpty(version))
             {
                 return CoolifyProbeResult.UnparseableResponse("version field missing or empty");
             }
 
-            return CoolifyProbeResult.Success(result.Version);
+            return CoolifyProbeResult.Success(version);
         }
         catch (OperationCanceledException)
         {

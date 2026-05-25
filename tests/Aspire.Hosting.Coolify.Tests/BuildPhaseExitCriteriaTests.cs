@@ -287,9 +287,13 @@ public sealed class BuildPhaseExitCriteriaTests
         using var h = new Harness(); // password sentinel injected
         await h.Publisher.RunBuildAsync(Resources("web", "worker"), NullLogger.Instance, default);
 
-        // Captured but not read: the password param is set on the publisher.
-        Assert.NotNull(h.Publisher.RegistryPassword);
-        Assert.NotNull(h.Publisher.RegistryUsername);
+        // FT-014: the shim attaches credentials to the synthetic registry as an annotation;
+        // the publisher does not retain a publisher-instance (prefix, user, pass) triple.
+        Assert.NotNull(h.Publisher.ShimDefaultRegistry);
+        Assert.NotNull(
+            h.Publisher.ShimDefaultRegistry!.Annotations
+                .OfType<CoolifyRegistryCredentialsAnnotation>()
+                .FirstOrDefault());
 
         // Sentinel must not leak through stderr.
         Assert.DoesNotContain(SentinelPassword, h.Stderr.ToString());

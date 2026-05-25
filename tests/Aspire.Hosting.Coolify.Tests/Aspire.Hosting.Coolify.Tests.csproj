@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <NoWarn>$(NoWarn);ASPIREPIPELINES001</NoWarn>
+    <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIRECOMPUTE003;CS0618</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

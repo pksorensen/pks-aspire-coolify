@@ -13,6 +13,7 @@ adrs:
 - ADR-005
 - ADR-001
 - ADR-006
+- ADR-007
 tests:
 - TC-005
 - TC-008
@@ -24,6 +25,26 @@ domains-acknowledged: {}
 ---
 
 ## Description
+
+> **ADR-007 amendment (FT-014).** The channel by which the configure-
+> phase Coolify Private Registry upsert and the push phase read the
+> image-push target has been changed from the publisher-instance
+> `(prefix, username, password)` triple captured by
+> `WithImageRegistry(...)` to the Aspire 13 native channel:
+> `ContainerRegistryResource` (declared with `AddContainerRegistry`)
+> attached to workloads via the `WithContainerRegistry(...)` edge in
+> the resource graph. The configure-phase upsert iterates the
+> *distinct* `(host, username)` set derived from the workloads'
+> registry edges, producing one upsert per pair (one if every
+> workload shares a registry, N if they don't). The push phase reads
+> per-workload credentials from each workload's attached registry
+> resource. `WithImageRegistry(...)` survives as a deprecated shim
+> that synthesises the workload→registry edge (FT-014 §Behaviour §0).
+> The four `E_…` symbols and every other observable contract below
+> are preserved verbatim. The v1.x reference text is preserved
+> below; treat every reference to "the publisher's captured
+> credentials" or "the captured prefix" as restated against the
+> workload→registry edge per ADR-007 §Decision §1.
 
 FT-004 fills in the **push phase** body that FT-001's skeleton left as a
 no-op, and additionally contributes one small step to the **configure
@@ -53,26 +74,33 @@ did not consume. ADR-004's redaction discipline applies to
 `registry-password` exactly as it does to `coolify-<name>-token`:
 never logged, never echoed, resolved through Aspire's parameter
 machinery, no caching beyond the in-memory client. Username and prefix
-are not secret and may appear in logs to aid diagnosis.
+are not secret and may appear in logs to aid diagnosis. *(Per ADR-007
+/ FT-014: these credentials are read from the
+`ContainerRegistryResource` attached to each workload, not from a
+publisher-instance triple. The redaction and "resolved-only-when-
+needed" disciplines are unchanged.)*
 
 **Anonymous push (no credentials) is a first-class supported path.**
-When the `username` / `password` pair is omitted (per ADR-005 §1 they
-travel as a pair: both set, or both unset), FT-004 skips *both* the
-configure-phase Coolify Private Registry upsert *and* any registry-
-auth handling in push. The registry is assumed publicly pullable
-(public `ghcr.io` namespace, or a homelab `registry:2` listed in the
-Coolify destination's `insecure-registries`). Failures to pull
-anonymously surface later, at `verify` (FT-006), with a precise
-Coolify-side error — they are not FT-004's concern.
+When a workload's attached `ContainerRegistryResource` carries no
+credentials (or, in v1.x source-compat, when the `username` /
+`password` pair is omitted on `WithImageRegistry(...)` per ADR-005
+§1 — pair semantics preserved), FT-004 skips *both* the
+configure-phase Coolify Private Registry upsert for that
+`(host, username)` pair *and* any registry-auth handling in push for
+that workload. The registry is assumed publicly pullable (public
+`ghcr.io` namespace, or a homelab `registry:2` listed in the Coolify
+destination's `insecure-registries`). Failures to pull anonymously
+surface later, at `verify` (FT-006).
 
-The exit criteria are: (a) when credentials are present, the configure
-phase upserts exactly one Coolify Private Registry record keyed by
-`(host, username)` per ADR-005 §D5, with `host` derived from the
-prefix's leading segment; (b) when credentials are absent, no Coolify
+The exit criteria are: (a) when any workload's attached registry
+carries credentials, the configure phase upserts exactly one Coolify
+Private Registry record per *distinct* `(host, username)` pair across
+the resource graph, with `host` derived from each registry resource's
+`Address`; (b) when every attached registry is anonymous, no Coolify
 Private Registry call is issued at all; (c) the push phase moves
 every image FT-003 built (one per containerisable resource) to the
 configured registry, using deterministic per-resource tags
-`<registry-prefix>/<resource-name>:<apphost-version>` exactly as FT-003
+`<address>/<resource-name>:<apphost-version>` exactly as FT-003
 emitted them, with no tag mutation; (d) on any push failure across the
 N resources, the publisher fails the phase, does not advance to
 `deploy`, and surfaces `E_IMAGE_PUSH_FAILED` (or the more specific
@@ -98,7 +126,11 @@ how FT-003 reuses the build pipeline.
   key, and to pass to the push pipeline), `username` and `password`
   (for both the Coolify-side upsert and the registry-side push auth).
   `prefix` is required; `username` and `password` are jointly optional
-  and travel as a pair (ADR-005 §1).
+  and travel as a pair (ADR-005 §1). *(Per ADR-007 / FT-014: this
+  input is restated as "the set of `ContainerRegistryResource`s
+  reachable from the containerisable workloads via the
+  `WithContainerRegistry(...)` edge in the resource graph." The
+  publisher no longer reads a triple from its own instance.)*
 - The `ICoolifyClient` instance constructed by FT-002 during the
   configure phase. FT-004's configure-phase upsert step issues calls
   through `client.PrivateRegistries` — a new endpoint group on the
@@ -110,6 +142,9 @@ how FT-003 reuses the build pipeline.
   `<prefix>/<resource-name>:<apphost-version>`. FT-004 enumerates the
   same resource set the build phase iterated (received from the
   publisher driver — FT-004 does not re-walk the Aspire graph).
+  *(Per ADR-007 / FT-014: `<prefix>` is sourced from each workload's
+  attached registry resource's `Address`; the rest of the shape is
+  unchanged.)*
 - Aspire's existing container-image **push** infrastructure — the same
   surface the Docker Compose publisher and `aspire-ssh-deploy` use to
   push a locally-tagged image to a registry, with credentials supplied
@@ -123,23 +158,24 @@ how FT-003 reuses the build pipeline.
 ### Outputs
 
 - **On success (push phase):** the push phase exits normally and yields
-  control to the `deploy` phase (FT-005). After exit, the configured
-  registry's namespace contains exactly one image per containerisable
-  resource at the deterministic tag, and no `latest` tag is present
-  (ADR-005 §D4 / §D6 — re-asserted at the push layer as FT-003's I-2
-  is re-asserted here). The publisher has emitted, per resource, an
-  Aspire-structured-log entry attributed to the `push` phase recording
-  the resource name, the full image tag, and the registry host (no
-  credentials).
-- **On success (configure-phase upsert step), credentials present:**
-  exactly one Coolify Private Registry record exists matching
-  `(host, username)`, tagged with the `managed-by:
-  pks-aspire-coolify` marker per ADR-005 §D5. Either one POST (create)
-  or zero/one PATCH (update password when changed) was issued. No
+  control to the `deploy` phase (FT-005). After exit, each configured
+  registry's namespace contains exactly one image per workload
+  attached to it at the deterministic tag, and no `latest` tag is
+  present (ADR-005 §D4 / §D6 — re-asserted at the push layer as
+  FT-003's I-2 is re-asserted here). The publisher has emitted, per
+  resource, an Aspire-structured-log entry attributed to the `push`
+  phase recording the resource name, the full image tag, and the
+  registry host (no credentials).
+- **On success (configure-phase upsert step), credentials present on
+  one or more attached registries:** one Coolify Private Registry
+  record exists per distinct `(host, username)` pair derived from
+  the graph, tagged with the `managed-by: pks-aspire-coolify`
+  marker per ADR-005 §D5. Either one POST (create) or zero/one
+  PATCH (update password when changed) was issued per pair. No
   duplicate records appear. Configure proceeds to `build`.
-- **On success (configure-phase upsert step), credentials absent:**
-  zero Coolify Private Registry calls were issued. Configure proceeds
-  to `build`.
+- **On success (configure-phase upsert step), every attached
+  registry is anonymous:** zero Coolify Private Registry calls were
+  issued. Configure proceeds to `build`.
 - **On any fail-fast path:** the publisher prints a single diagnostic
   to stderr whose first whitespace-delimited token is one of the four
   literal symbols below, exits non-zero, does not enter the *next*
@@ -153,7 +189,7 @@ how FT-003 reuses the build pipeline.
 
   | Symbol                              | Stderr-visible literal              | Phase     | Trigger                                                                  |
   |-------------------------------------|-------------------------------------|-----------|--------------------------------------------------------------------------|
-  | `E_COOLIFY_REGISTRY_UPSERT_FAILED`  | `E_COOLIFY_REGISTRY_UPSERT_FAILED`  | configure | Coolify reachable but `PrivateRegistries` POST/PATCH returned non-2xx     |
+  | `E_COOLIFY_REGISTRY_UPSERT_FAILED`  | `E_COOLIFY_REGISTRY_UPSERT_FAILED`  | configure | Coolify reachable but `PrivateRegistries` POST/PATCH returned non-2xx for any `(host, username)` pair |
   | `E_REGISTRY_AUTH_FAILED`            | `E_REGISTRY_AUTH_FAILED`            | push      | Registry returned 401 or 403 on push for any resource                    |
   | `E_IMAGE_PUSH_FAILED`               | `E_IMAGE_PUSH_FAILED`               | push      | Any other push failure for any resource (5xx, timeout, refused, DNS, TLS, manifest reject) |
   | `E_PUSH_PHASE_UNEXPECTED`           | `E_PUSH_PHASE_UNEXPECTED`           | push      | Catch-all for unclassifiable failures inside the push phase body         |
@@ -164,14 +200,14 @@ how FT-003 reuses the build pipeline.
   ```
   <E_SYMBOL>: <one-line human description>
     resource(s): <aspire-resource-name>[, …]      (for IMAGE_PUSH_FAILED / REGISTRY_AUTH_FAILED / PUSH_PHASE_UNEXPECTED)
-    tag(s):      <prefix>/<resource>:<version>[, …]  (for IMAGE_PUSH_FAILED / REGISTRY_AUTH_FAILED)
+    tag(s):      <address>/<resource>:<version>[, …]  (for IMAGE_PUSH_FAILED / REGISTRY_AUTH_FAILED)
     registry:    <host>                           (for IMAGE_PUSH_FAILED / REGISTRY_AUTH_FAILED / COOLIFY_REGISTRY_UPSERT_FAILED)
     username:    <resolved-username>              (for REGISTRY_AUTH_FAILED / COOLIFY_REGISTRY_UPSERT_FAILED — never the password)
-    see:         ADR-005 §D5                      (for COOLIFY_REGISTRY_UPSERT_FAILED)
+    see:         ADR-005 §D5 / ADR-007 §Decision §1 (for COOLIFY_REGISTRY_UPSERT_FAILED)
     remediation:
-      verify the registry-username / registry-password Aspire parameters     (for REGISTRY_AUTH_FAILED)
-      verify network reach to <host> from the AppHost build machine          (for IMAGE_PUSH_FAILED)
-      check Coolify's Private Registries view for stale or duplicate records (for COOLIFY_REGISTRY_UPSERT_FAILED)
+      verify the credentials attached to the ContainerRegistryResource <name>     (for REGISTRY_AUTH_FAILED)
+      verify network reach to <host> from the AppHost build machine               (for IMAGE_PUSH_FAILED)
+      check Coolify's Private Registries view for stale or duplicate records      (for COOLIFY_REGISTRY_UPSERT_FAILED)
   ```
 
   The first whitespace-delimited token on the first line is the literal
@@ -184,9 +220,10 @@ how FT-003 reuses the build pipeline.
   ADR-003 §4 and FT-001 invariant I-3). The only externally-observable
   artefacts FT-004 produces are (a) the image-tag entries that appear
   in the *registry's* storage as a result of the push, and (b) the
-  Coolify-side Private Registry record (when credentials are present).
-  Neither is a file under the AppHost directory; neither is written by
-  FT-004 directly to local disk.
+  Coolify-side Private Registry record(s) (when any workload's
+  attached registry carries credentials). Neither is a file under
+  the AppHost directory; neither is written by FT-004 directly to
+  local disk.
 - **In-memory state is bounded to the configure-phase upsert step and
   the push phase.** The resolved `username` and `password` strings
   live in the local scope of the upsert step (where they are handed
@@ -221,54 +258,54 @@ These steps run sequentially after FT-002's combined version+auth
 probe has succeeded. If any step fails, configure exits non-zero with
 `E_COOLIFY_REGISTRY_UPSERT_FAILED` and does not enter `build`.
 
-1. **Check whether registry credentials are configured.** Look at the
-   publisher's captured `(username, password)` handles. If
-   `WithImageRegistry(...)` was called with both omitted (anonymous-
-   push path), **skip this entire step**: no resolution, no Coolify
-   call, no log entry beyond a single structured "anonymous registry
-   push — Coolify-side upsert skipped" debug-level line. Configure
-   proceeds to `build` as if FT-004 contributed nothing.
+1. **Enumerate the distinct `(host, username)` pair set.** *(Per
+   ADR-007 / FT-014.)* For each containerisable workload, follow its
+   `WithContainerRegistry(...)` edge to a `ContainerRegistryResource`
+   (the shim, if used, has already synthesised this edge for
+   v1.x-shape AppHosts). Read the registry resource's `Address` and
+   its attached credentials, if any. Collect the distinct set of
+   `(host, username)` pairs across the graph where the registry
+   carries credentials. Workloads attached to anonymous registries
+   contribute nothing to this set.
 
-2. **Resolve `(username, password)`.** Request the resolved string
-   values of the two parameter handles through Aspire's standard
-   parameter-resolution API (matching FT-002 §Behaviour §1 for the
-   Coolify token). If exactly one resolves to a non-empty value and
-   the other resolves to null/empty, treat as
-   `E_COOLIFY_REGISTRY_UPSERT_FAILED` with a remediation message
-   pointing at ADR-005 §1's "credentials travel as a pair" rule.
-   (FT-003 §Behaviour §0 already throws `ArgumentException` at AppHost
-   build time when this asymmetry exists at the call site; the runtime
-   check here is a defence in depth for cases where the parameter
-   values themselves are mismatched.)
+2. **If the distinct set is empty**, skip the entire upsert step:
+   no resolution, no Coolify call, no log entry beyond a single
+   structured "anonymous registry push — Coolify-side upsert skipped"
+   debug-level line. Configure proceeds to `build` as if FT-004
+   contributed nothing.
 
-3. **Derive the registry host.** Read the `prefix` parameter (already
-   resolved during FT-003's build-phase pre-flight is not assumed —
-   FT-004 resolves freshly here, matching FT-002's I-4 "exactly once
-   per deploy" pattern applied per-phase). The `host` is the substring
-   of `prefix` before the first `/`. Example: `ghcr.io/pksorensen/myapp`
-   → `ghcr.io`. Example: `registry.lan:5000/myapp` → `registry.lan:5000`.
-   No validation beyond "non-empty"; the registry's own response on
-   push will surface bad hosts.
+3. **For each `(host, username)` pair in the distinct set:**
+   1. Resolve `(username, password)` for that pair through Aspire's
+      standard parameter-resolution API (matching FT-002 §Behaviour §1
+      for the Coolify token). If exactly one resolves to a non-empty
+      value and the other resolves to null/empty, treat as
+      `E_COOLIFY_REGISTRY_UPSERT_FAILED` with a remediation message
+      pointing at ADR-005 §1's "credentials travel as a pair" rule.
+      (FT-003 §Behaviour §0 already throws `ArgumentException` at
+      AppHost build time when this asymmetry exists at the call site;
+      the runtime check here is defence in depth.)
+   2. `host` is the substring of the registry resource's `Address`
+      before the first `/`. Example: `ghcr.io/pksorensen/myapp`
+      → `ghcr.io`. Example: `registry.lan:5000/myapp` →
+      `registry.lan:5000`. No validation beyond "non-empty"; the
+      registry's own response on push will surface bad hosts.
+   3. Call `client.PrivateRegistries.UpsertAsync(host, username,
+      password, cancellationToken)` (final method name chosen
+      against ADR-002's client surface at implementation time). The
+      client is expected to implement GET-by-`(host, username)` →
+      POST-if-absent / PATCH-if-present-and-password-changed,
+      tagging new records with the `managed-by: pks-aspire-coolify`
+      suffix per ADR-005 §D5.
 
-4. **Issue the Private Registry upsert.** Call
-   `client.PrivateRegistries.UpsertAsync(host, username, password,
-   cancellationToken)` (final method name chosen against ADR-002's
-   client surface at implementation time). The client is expected to
-   implement GET-by-`(host, username)` → POST-if-absent /
-   PATCH-if-present-and-password-changed, tagging new records with
-   the `managed-by: pks-aspire-coolify` suffix per ADR-005 §D5. The
-   client is the single owner of the `/api/v1/...` path, the DTO
-   shape, the marker-suffix placement, and the password-change
-   detection (Coolify reports a presence/hash, never the value, so
-   the comparison is hash-based or always-PATCH; either is acceptable
-   and is ADR-002's concern, not FT-004's).
-
-5. **Classify the result.** Success → continue. Any non-2xx response,
-   thrown `HttpRequestException`, timeout, or other client-surfaced
-   error → fail-fast `E_COOLIFY_REGISTRY_UPSERT_FAILED` with the
-   structured field block (registry host, username, ADR pointer). The
-   diagnostic includes the underlying error's `Message` (no stack
-   trace, no password content).
+4. **Classify aggregated results.** Any non-2xx response, thrown
+   `HttpRequestException`, timeout, or other client-surfaced error
+   for *any* pair → fail-fast `E_COOLIFY_REGISTRY_UPSERT_FAILED`
+   with the structured field block (registry host, username, ADR
+   pointer). The diagnostic includes the underlying error's
+   `Message` (no stack trace, no password content). All pairs are
+   attempted before the diagnostic is emitted, mirroring the push
+   phase's "attempt every resource before reporting failure"
+   discipline (FT-004 §I-9 below).
 
 #### Push-phase contribution — registry push of built images
 
@@ -284,20 +321,21 @@ fails for any resource, push exits non-zero with the matching
    re-derive image tags (each tag was computed once during build per
    FT-003 §Behaviour §4 and is reused here verbatim).
 
-2. **Resolve registry credentials (or confirm anonymous).** If
-   `WithImageRegistry(...)` was called with `(username, password)`
-   present, resolve both through Aspire's standard parameter API.
-   If absent, the push proceeds anonymously — no resolution, no
-   credential argument passed to the push pipeline beyond what
-   Aspire's pipeline does by default for an anonymous push.
+2. **Per workload, resolve registry credentials (or confirm anonymous).**
+   *(Per ADR-007 / FT-014.)* Follow each workload's
+   `WithContainerRegistry(...)` edge to its `ContainerRegistryResource`.
+   If credentials are attached, resolve `(username, password)`
+   through Aspire's standard parameter API. If the registry is
+   anonymous, no credential argument is passed to the push pipeline
+   for that workload beyond what Aspire's pipeline does by default
+   for an anonymous push.
 
 3. **For each resource in the enumeration, push.** For every resource:
    1. Read the resource's image tag — the deterministic
-      `<prefix>/<resource.Name>:<apphost-version>` string that FT-003
-      attached to the local image. FT-004 does not recompute the tag
-      from `prefix` + `resource.Name` + version; it reads what build
-      emitted so that any divergence between build's tag and push's
-      tag is impossible by construction.
+      `<address>/<resource.Name>:<apphost-version>` string that FT-003
+      attached to the local image. FT-004 does not recompute the tag;
+      it reads what build emitted so that any divergence between
+      build's tag and push's tag is impossible by construction.
    2. Invoke Aspire's container-image **push** pipeline for this
       image tag, passing the resolved registry credentials (or
       passing the anonymous indicator). The pipeline's existing
@@ -319,7 +357,7 @@ fails for any resource, push exits non-zero with the matching
 4. **Aggregate failures and exit.** After every resource has been
    attempted (push does **not** short-circuit on the first failure —
    it attempts all N so the diagnostic can name the full set, which
-   is more useful than \"the first one failed\"):
+   is more useful than "the first one failed"):
    - If the `REGISTRY_AUTH_FAILED` bucket is non-empty, fail-fast
      `E_REGISTRY_AUTH_FAILED` with all failing (resource, tag) pairs.
      Auth failures take precedence in the diagnostic because they
@@ -370,19 +408,23 @@ FT-002's `E_COOLIFY_UNREACHABLE` catch-all and FT-003's
 ### Invariants
 
 - **I-1: anonymous-push mode issues zero Coolify Private Registry
-  calls.** When `WithImageRegistry(...)` is called with both
-  `username` and `password` omitted, the configure-phase contribution
-  performs no GET, POST, or PATCH against `client.PrivateRegistries`.
-  Asserted by intercepting outbound HTTP during a happy-path
-  anonymous deploy and asserting zero requests to the `PrivateRegistries`
-  endpoint group.
+  calls.** When every containerisable workload's attached
+  `ContainerRegistryResource` is anonymous (no credentials), the
+  configure-phase contribution performs no GET, POST, or PATCH
+  against `client.PrivateRegistries`. Asserted by intercepting
+  outbound HTTP during a happy-path anonymous deploy and asserting
+  zero requests to the `PrivateRegistries` endpoint group.
 - **I-2: credentialled mode upserts exactly one Private Registry
   record per `(host, username)` pair, idempotently.** Re-running the
   same deploy with unchanged credentials produces zero net change on
   the Coolify side (no new record, no spurious PATCH) on the second
   run. Re-running with a *changed* password produces exactly one
-  PATCH. Re-running with a *different username* produces a new record
-  (a different `(host, username)` tuple, per ADR-005's keying rule).
+  PATCH per affected pair. Re-running with a *different username*
+  produces a new record per affected pair (a different
+  `(host, username)` tuple, per ADR-005's keying rule). *(Per
+  ADR-007 / FT-014: distinct workloads attached to distinct
+  registries with distinct hosts produce one upsert per pair; the
+  set semantics are unchanged.)*
 - **I-3: the resolved password string is never logged, echoed, or
   written to disk.** This includes diagnostic messages, exception
   messages, Aspire structured-log fields, the Aspire dashboard
@@ -441,7 +483,10 @@ FT-002's `E_COOLIFY_UNREACHABLE` catch-all and FT-003's
   Neither phase stores the resolved strings on the publisher
   instance, and the resolved values go out of scope as the phase
   exits. (Composes with FT-003 §I-6 "captured but never
-  dereferenced" — FT-004 is the dereferencing feature.)
+  dereferenced" — FT-004 is the dereferencing feature.) *(Per
+  ADR-007 / FT-014: the credentials live on the
+  `ContainerRegistryResource` rather than the publisher; the
+  dereferencing discipline is unchanged.)*
 
 ### Error handling
 
@@ -477,25 +522,28 @@ this feature introduces. Beyond them:
   diagnostic's `resource(s)` and `tag(s)` fields under a "and N
   additional non-auth failures" line so the user sees the full
   picture.
-- **`registry-prefix` resolves to null/empty at FT-004's
-  configure-phase contribution start time.** Already an
-  `E_REGISTRY_NOT_CONFIGURED` from FT-003 §Behaviour §1 — but FT-003's
-  check fires at the start of the *build* phase. Since FT-004's
-  configure-phase step runs *before* build, FT-004 must check `prefix`
-  too: if `WithImageRegistry(...)` was not called, FT-004 simply
-  skips its configure-phase contribution (the missing-prefix case
-  is FT-003's to surface at the build-phase boundary, with the
-  same `E_REGISTRY_NOT_CONFIGURED` diagnostic). FT-004 does not
-  invent a parallel "registry not configured" symbol.
+- **A workload has no registry edge at FT-004's configure-phase
+  contribution start time.** Already surfaced as
+  `E_REGISTRY_NOT_CONFIGURED` by FT-003 at the build-phase boundary
+  (per ADR-007 / FT-014's restatement of that trigger). Since
+  FT-004's configure-phase step runs *before* build, FT-004 simply
+  proceeds with whatever distinct `(host, username)` set the
+  resource graph yields — if a workload has no edge, it contributes
+  nothing to the set, and FT-003 will surface the missing-edge
+  diagnostic when build runs. FT-004 does not invent a parallel
+  "registry not configured" symbol.
 
 ### Boundaries
 
 - **In scope for FT-004:**
   - the configure-phase Coolify Private Registry upsert step (per
-    ADR-005 §D5, anchored after FT-002's auth probe, before `build`)
-  - resolving the `(username, password)` parameter handles (which
-    FT-003 captured but did not consume)
-  - deriving the registry host from the prefix's leading segment
+    ADR-005 §D5, anchored after FT-002's auth probe, before `build`;
+    per ADR-007 / FT-014, iterating the distinct `(host, username)`
+    set across the graph rather than the publisher-instance triple)
+  - resolving the `(username, password)` credentials attached to
+    each `ContainerRegistryResource`
+  - deriving the registry host from each registry resource's
+    `Address` leading segment
   - issuing the upsert through `client.PrivateRegistries.UpsertAsync(...)`
     on the existing `ICoolifyClient` (ADR-002 owns the endpoint paths
     and DTO shape)
@@ -503,7 +551,7 @@ this feature introduces. Beyond them:
     Aspire's push pipeline with resolved credentials (or anonymous),
     aggregated failure classification, structured diagnostics
   - the anonymous-push path: skipping both the configure-phase upsert
-    and any push-side credential handling
+    and any push-side credential handling for anonymous registries
   - the four `E_…` diagnostics with literal symbols, structured field
     blocks, and zero secret content
   - cancellation honouring at phase boundaries and as propagated by
@@ -513,7 +561,11 @@ this feature introduces. Beyond them:
 - **Out of scope for FT-004** (handled elsewhere or deferred):
   - the `WithImageRegistry(...)` extension itself (signature, handle
     capture, last-call-wins idempotency, ArgumentException on
-    `(username XOR password)` at the call site) → **FT-003**
+    `(username XOR password)` at the call site) → **FT-003**;
+    rewritten as a deprecated shim by **FT-014**
+  - the channel change to native `ContainerRegistryResource` +
+    `WithContainerRegistry` edge reads → **FT-014** (this body
+    annotates the amendment inline; FT-014 owns the implementation)
   - the actual `/api/v1/...` paths, request/response DTOs, marker-
     suffix placement, and password-change detection for the
     Private Registries endpoint group → **ADR-002 + the
@@ -566,7 +618,7 @@ this feature introduces. Beyond them:
 - **Distinguishing 401 from 403 in `E_REGISTRY_AUTH_FAILED`.** Mirrors
   ADR-004's "one opaque error path for auth" rationale. Both surface
   as the same symbol with the same remediation ("verify the
-  registry-username / registry-password Aspire parameters").
+  credentials attached to the ContainerRegistryResource").
 - **A `--dry-run` mode for the push phase.** No such mode in v1;
   push always pushes or fails fast. Plan/apply separation was
   rejected by ADR-003 §Rationale.
@@ -584,3 +636,6 @@ this feature introduces. Beyond them:
   A future feature may add `aspire coolify gc` semantics; not v1.
 - **Affecting the `latest` tag.** I-5 re-asserts FT-003 §I-2: no
   `latest` push, no `latest` tag operation of any kind.
+- **The publisher-instance triple read path.** Superseded by
+  ADR-007 / FT-014's native channel; the triple no longer lives as
+  a field on `CoolifyDeployingPublisher` after FT-014 lands.

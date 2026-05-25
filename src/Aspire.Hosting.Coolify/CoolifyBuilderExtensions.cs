@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 // Implements ADR-003: Imperative deploy orchestration with idempotent per-resource upserts (v1)
 // Implements ADR-004: Coolify auth model — bearer token via Aspire secret parameters, per-instance (v1)
 // Implements ADR-005: Image registry strategy — explicit publisher-push to a developer-chosen registry (v1)
+// Implements ADR-007: Adopt Aspire native ContainerRegistry primitives in the publisher's push-target read path (v1)
 // FT-001 §B: extension methods live in the Aspire.Hosting namespace (NOT
 // Aspire.Hosting.Coolify) so consumers — whose AppHost projects already import
 // Aspire.Hosting via implicit usings — get WithCoolifyDeploy / WithImageRegistry /
@@ -104,11 +105,14 @@ public static class CoolifyBuilderExtensions
     }
 
     /// <summary>
-    /// Registers the image-registry coordinates the publisher's build (and FT-004 push)
-    /// phases use. Fixed signature per ADR-005 §1: <c>prefix</c> required; <c>username</c>
-    /// and <c>password</c> jointly optional (either both set, or both null). FT-003 captures
-    /// the parameter handles only and never reads <c>username</c> / <c>password</c> values
-    /// (I-6). Calling this method twice on the same builder is last-call-wins (FT-003 I-8).
+    /// Deprecated v1.x source-compat shim per ADR-007. Synthesises a
+    /// <see cref="ContainerRegistryResource"/> via
+    /// <see cref="ContainerRegistryResourceBuilderExtensions.AddContainerRegistry(IDistributedApplicationBuilder,string,IResourceBuilder{ParameterResource},IResourceBuilder{ParameterResource})"/>
+    /// from the supplied prefix parameter, attaches optional credentials, and registers it as
+    /// the implicit fallback registry that the FT-014 publisher read path uses for every
+    /// containerisable workload that has no explicit <c>WithContainerRegistry(...)</c> edge.
+    /// Prefer <c>AddContainerRegistry(...)</c> + <c>WithContainerRegistry(...)</c> directly
+    /// for new AppHosts.
     /// </summary>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> or
     /// <paramref name="prefix"/> is null.</exception>
@@ -116,6 +120,7 @@ public static class CoolifyBuilderExtensions
     /// / <paramref name="password"/> is non-null (they travel as a pair per ADR-005 §1).</exception>
     /// <exception cref="InvalidOperationException">Thrown when
     /// <see cref="WithCoolifyDeploy"/> has not been called first on <paramref name="builder"/>.</exception>
+    [Obsolete("Use AddContainerRegistry + WithContainerRegistry — see ADR-007.", error: false)]
     public static IDistributedApplicationBuilder WithImageRegistry(
         this IDistributedApplicationBuilder builder,
         IResourceBuilder<ParameterResource> prefix,
@@ -142,12 +147,47 @@ public static class CoolifyBuilderExtensions
             ?? throw new InvalidOperationException(
                 "WithImageRegistry(...) requires a prior WithCoolifyDeploy(...) call on the same builder.");
 
-        // FT-003 I-8: last-call-wins.
-        publisher.RegistryPrefix = prefix;
-        publisher.RegistryUsername = username;
-        publisher.RegistryPassword = password;
+        // ADR-007 §Decision §4.1: deterministic synthetic name so repeated calls with the
+        // same prefix converge on the same resource (FT-014 I-8).
+        var syntheticName = "coolify-legacy-" + StableHash(prefix.Resource.Name);
+
+        IResourceBuilder<ContainerRegistryResource> registryBuilder;
+        if (publisher.TryGetShimRegistry(syntheticName, out var existing))
+        {
+            registryBuilder = existing!;
+        }
+        else
+        {
+            registryBuilder = builder.AddContainerRegistry(syntheticName, prefix);
+            publisher.RegisterShimRegistry(syntheticName, registryBuilder);
+        }
+
+        // Attach credentials annotation when both supplied. Repeated calls overwrite per
+        // FT-003 I-8 last-call-wins semantics.
+        if (username is not null && password is not null)
+        {
+            registryBuilder.WithAnnotation(
+                new CoolifyRegistryCredentialsAnnotation(username, password),
+                ResourceAnnotationMutationBehavior.Replace);
+        }
+
+        // FT-014 §0 step 4: the latest shim call provides the implicit default for workloads
+        // without an explicit edge. Last-call-wins matches FT-003 I-8.
+        publisher.ShimDefaultRegistry = registryBuilder.Resource;
 
         return builder;
+    }
+
+    /// <summary>
+    /// Stable, deterministic, ASCII-safe 16-hex-character hash for use in synthesised
+    /// resource names. Independent of <see cref="object.GetHashCode"/> (which is
+    /// process-local) so the same prefix produces the same synthetic name across builds.
+    /// </summary>
+    private static string StableHash(string input)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(input);
+        var hash = System.Security.Cryptography.SHA1.HashData(bytes);
+        return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
     }
 
     /// <summary>

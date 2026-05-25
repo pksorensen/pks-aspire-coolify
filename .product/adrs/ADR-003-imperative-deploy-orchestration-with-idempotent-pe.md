@@ -16,6 +16,8 @@ features:
 - FT-011
 - FT-012
 - FT-013
+- FT-014
+- FT-015
 supersedes: []
 superseded-by: []
 domains:

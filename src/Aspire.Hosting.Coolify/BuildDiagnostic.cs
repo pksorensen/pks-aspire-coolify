@@ -51,8 +51,15 @@ public sealed class BuildDiagnostic
         switch (Symbol)
         {
             case BuildSymbol.RegistryNotConfigured:
-                sb.AppendLine("  see:      ADR-005 §1");
+                if (!string.IsNullOrEmpty(Resource))
+                {
+                    sb.AppendLine($"  resource: {Resource}");
+                }
+                sb.AppendLine("  see:      ADR-005 §1; ADR-007");
                 sb.AppendLine("  remediation:");
+                sb.AppendLine("    var reg = builder.AddContainerRegistry(\"name\", \"host/prefix\");");
+                sb.AppendLine("    builder.AddProject<...>(\"<name>\").WithContainerRegistry(reg);");
+                sb.AppendLine("    // or (deprecated, v1.x source-compat only):");
                 sb.AppendLine("    builder.WithCoolifyDeploy(url, token)");
                 sb.AppendLine("           .WithImageRegistry(prefix, [user, pass]);");
                 break;

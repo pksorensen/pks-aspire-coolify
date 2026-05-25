@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 // Implements ADR-003: Imperative deploy orchestration with idempotent per-resource upserts (v1)
 // Implements ADR-004: Coolify auth model — bearer token via Aspire secret parameters, per-instance (v1)
 // Implements ADR-005: Image registry strategy — explicit publisher-push to a developer-chosen registry (v1)
+// Implements ADR-007: Adopt Aspire native ContainerRegistry primitives in the publisher's push-target read path (v1)
 // Implements FT-012: Interactive parameter prompting in the configure phase (amends ADR-004 §5a)
 namespace Aspire.Hosting.Coolify;
 
@@ -170,18 +171,42 @@ public sealed class CoolifyDeployingPublisher
     public ConfigureDiagnostic? LastDiagnostic { get; private set; }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // FT-003 — build phase state. Captured by WithImageRegistry(...) at registration
-    // time and consumed by the build phase. (FT-003 §0, §1.)
+    // FT-014 — registry edge state. The publisher reads the push target from the
+    // Aspire resource graph via ContainerRegistryReferenceAnnotation per ADR-007.
+    // The deprecated WithImageRegistry(...) shim contributes by registering a
+    // synthetic ContainerRegistryResource as the implicit fallback for workloads
+    // without an explicit edge.
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// <summary>Registry image-prefix parameter (e.g. <c>ghcr.io/user/app</c>). Required for build.</summary>
-    public IResourceBuilder<ParameterResource>? RegistryPrefix { get; internal set; }
+    /// <summary>
+    /// The synthetic registry resource registered by the most recent
+    /// <c>WithImageRegistry(...)</c> shim call, used as the implicit fallback for
+    /// containerisable workloads that have no explicit
+    /// <see cref="ContainerRegistryResourceBuilderExtensions.WithContainerRegistry{TDestination,TContainerRegistry}"/>
+    /// edge (FT-014 §0 step 4). Null when the shim was never called.
+    /// </summary>
+    public ContainerRegistryResource? ShimDefaultRegistry { get; internal set; }
 
-    /// <summary>Optional registry username parameter (FT-004 consumes; FT-003 captures only — I-6).</summary>
-    public IResourceBuilder<ParameterResource>? RegistryUsername { get; internal set; }
+    // Map of syntheticName → registry-builder, used by the shim to converge repeated calls
+    // with the same prefix on a single resource (FT-014 I-8, ADR-007 §Decision §4.1).
+    private readonly Dictionary<string, IResourceBuilder<ContainerRegistryResource>> _shimRegistries =
+        new(StringComparer.Ordinal);
 
-    /// <summary>Optional registry password parameter (FT-004 consumes; FT-003 captures only — I-6).</summary>
-    public IResourceBuilder<ParameterResource>? RegistryPassword { get; internal set; }
+    internal bool TryGetShimRegistry(string syntheticName, out IResourceBuilder<ContainerRegistryResource>? registry)
+    {
+        if (_shimRegistries.TryGetValue(syntheticName, out var found))
+        {
+            registry = found;
+            return true;
+        }
+        registry = null;
+        return false;
+    }
+
+    internal void RegisterShimRegistry(string syntheticName, IResourceBuilder<ContainerRegistryResource> registry)
+    {
+        _shimRegistries[syntheticName] = registry;
+    }
 
     /// <summary>Aspire image build pipeline binding. Defaults to a stub that throws; tests / host wire the real one.</summary>
     public IImageBuildPipeline ImagePipeline { get; set; } = new UnconfiguredImageBuildPipeline();
@@ -656,25 +681,27 @@ public sealed class CoolifyDeployingPublisher
 
         try
         {
-            // Step 1: verify a registry prefix is configured.
-            if (RegistryPrefix is null)
-            {
-                return EmitAndReturnBuild(new BuildDiagnostic
-                {
-                    Symbol = BuildSymbol.RegistryNotConfigured,
-                });
-            }
+            // Materialise the resource set once so we can pre-walk it for the
+            // registry-edge gate without re-enumerating a stateful provider.
+            var resourceList = resources.ToList();
 
-            // FT-012: prompt for the registry-prefix value when the deploy is interactive
-            // and the parameter is unset; the build phase consumes the prompted value as its
-            // image-prefix (TC-019 §3). Non-interactive fail-fast preserved (TC-020 §4).
-            var prefixValue = await ResolveOrPromptAsync(RegistryPrefix, isSecret: false, cancellationToken)
-                .ConfigureAwait(false);
-            if (string.IsNullOrEmpty(prefixValue))
+            // FT-014 §A: verify every containerisable workload has a registry edge.
+            // Workloads with neither an explicit ContainerRegistryReferenceAnnotation nor
+            // a shim-synthesised default fail fast with E_REGISTRY_NOT_CONFIGURED.
+            var unattached = new List<string>();
+            foreach (var resource in resourceList)
+            {
+                if (ResolveRegistryFor(resource) is null)
+                {
+                    unattached.Add(resource.Name);
+                }
+            }
+            if (unattached.Count > 0)
             {
                 return EmitAndReturnBuild(new BuildDiagnostic
                 {
                     Symbol = BuildSymbol.RegistryNotConfigured,
+                    Resource = string.Join(",", unattached),
                 });
             }
 
@@ -692,13 +719,26 @@ public sealed class CoolifyDeployingPublisher
                 });
             }
 
-            // Step 3 + 4: iterate, build, tag.
+            // Step 3 + 4: iterate, build, tag (FT-014 §B: address comes from the registry
+            // resource attached to *this* workload).
             var emitted = new List<string>();
-            foreach (var resource in resources)
+            foreach (var resource in resourceList)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var tag = $"{prefixValue}/{resource.Name}:{version}";
+                var registry = ResolveRegistryFor(resource)!;
+                var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
+                    .ConfigureAwait(false);
+                if (string.IsNullOrEmpty(address))
+                {
+                    return EmitAndReturnBuild(new BuildDiagnostic
+                    {
+                        Symbol = BuildSymbol.RegistryNotConfigured,
+                        Resource = resource.Name,
+                    });
+                }
+
+                var tag = $"{address}/{resource.Name}:{version}";
 
                 try
                 {
@@ -760,7 +800,7 @@ public sealed class CoolifyDeployingPublisher
     /// <see cref="RunConfigureAsync"/> succeeds. When registry credentials are absent (or
     /// <see cref="WithImageRegistry"/> was never called), this is a structured no-op
     /// (anonymous-push path — I-1). When present, derives the registry host from
-    /// <see cref="RegistryPrefix"/> and calls
+    /// the registry edge attached to each containerisable workload and calls
     /// <see cref="IPrivateRegistriesApi.UpsertAsync"/>. On any failure emits
     /// <c>E_COOLIFY_REGISTRY_UPSERT_FAILED</c> to <see cref="ErrorWriter"/>.
     /// </summary>
@@ -769,110 +809,200 @@ public sealed class CoolifyDeployingPublisher
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        // Anonymous-push path: WithImageRegistry not called at all, or called without creds.
-        if (RegistryPrefix is null || (RegistryUsername is null && RegistryPassword is null))
-        {
-            return RegistryUpsertOutcome.SkippedAnonymous();
-        }
+        // FT-014 §C: enumerate distinct (host, username) pairs across the resource set's
+        // registry edges + the shim default. The shim's synthetic registry is included even
+        // when no workloads have been wired through ResourcesToBuild — its credentials are
+        // the developer's stated intent for the configure-phase upsert.
+        var registries = CollectDistinctRegistries(
+            ResourcesToBuild?.Invoke() ?? Array.Empty<IResource>());
 
-        // Defence-in-depth (FT-003 catches the call-site asymmetry; this catches runtime
-        // resolution asymmetry — FT-004 §"Error handling").
-        if (RegistryUsername is null || RegistryPassword is null)
+        if (registries.Count == 0)
         {
-            return EmitAndReturnUpsert(new PushDiagnostic
-            {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Detail = "registry username/password parameter handles are asymmetric",
-                RemediationHint = "credentials travel as a pair — set both or neither (ADR-005 §1)",
-            });
-        }
-
-        // FT-012: prompt for the registry-prefix value when the deploy is interactive and
-        // the parameter is unset. The cache (I-3) guarantees subsequent build/push phases
-        // reuse this value without a second prompt.
-        var prefixValue = await ResolveOrPromptAsync(RegistryPrefix, isSecret: false, cancellationToken)
-            .ConfigureAwait(false);
-        if (string.IsNullOrEmpty(prefixValue))
-        {
-            // No prefix configured → FT-003 will surface E_REGISTRY_NOT_CONFIGURED at build.
-            // FT-004 does not invent a parallel symbol here.
-            return RegistryUpsertOutcome.SkippedAnonymous();
-        }
-        var host = DeriveHost(prefixValue);
-
-        // Resolve credentials (only here, only when needed — I-11).
-        string? usernameValue;
-        string? passwordValue;
-        try
-        {
-            usernameValue = await RegistryUsername.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-            passwordValue = await RegistryPassword.Resource.GetValueAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            return EmitAndReturnUpsert(new PushDiagnostic
-            {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Registry = host,
-                Detail = RedactPassword(ex.Message, passwordValue: null),
-            });
-        }
-
-        var userPresent = !string.IsNullOrWhiteSpace(usernameValue);
-        var passPresent = !string.IsNullOrWhiteSpace(passwordValue);
-        if (userPresent ^ passPresent)
-        {
-            return EmitAndReturnUpsert(new PushDiagnostic
-            {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Registry = host,
-                Username = userPresent ? usernameValue : null,
-                Detail = "registry-username and registry-password resolved asymmetrically",
-                RemediationHint = "credentials travel as a pair — set both or neither (ADR-005 §1)",
-            });
-        }
-        if (!userPresent && !passPresent)
-        {
-            // Both empty at runtime → anonymous path.
             return RegistryUpsertOutcome.SkippedAnonymous();
         }
 
         var client = ResolvedClient
             ?? ClientFactory.Create(string.Empty, string.Empty); // defence: shouldn't happen post-probe
 
-        PrivateRegistryUpsertResult upsertResult;
-        try
-        {
-            upsertResult = await client.PrivateRegistries
-                .UpsertAsync(host, usernameValue!, passwordValue!, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
-            return EmitAndReturnUpsert(new PushDiagnostic
-            {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Registry = host,
-                Username = usernameValue,
-                Detail = RedactPassword(ex.Message, passwordValue),
-            });
-        }
+        // Dedupe by (host, username); skip registries without credentials (anonymous).
+        var seen = new HashSet<(string Host, string User)>();
+        var anyCredentialled = false;
 
-        if (upsertResult.Kind != PrivateRegistryUpsertKind.Success)
+        foreach (var registry in registries)
         {
-            return EmitAndReturnUpsert(new PushDiagnostic
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
+                .ConfigureAwait(false);
+            if (string.IsNullOrEmpty(address))
             {
-                Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
-                Registry = host,
-                Username = usernameValue,
-                Detail = RedactPassword(upsertResult.ErrorMessage, passwordValue),
-            });
+                continue;
+            }
+            var host = DeriveHost(address);
+
+            var credAnn = registry.Annotations
+                .OfType<CoolifyRegistryCredentialsAnnotation>()
+                .FirstOrDefault();
+            if (credAnn is null)
+            {
+                continue; // anonymous registry — no upsert per FT-014 §C.
+            }
+
+            string? usernameValue;
+            string? passwordValue;
+            try
+            {
+                usernameValue = await credAnn.Username.Resource.GetValueAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                passwordValue = await credAnn.Password.Resource.GetValueAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnUpsert(new PushDiagnostic
+                {
+                    Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
+                    Registry = host,
+                    Detail = RedactPassword(ex.Message, passwordValue: null),
+                });
+            }
+
+            var userPresent = !string.IsNullOrWhiteSpace(usernameValue);
+            var passPresent = !string.IsNullOrWhiteSpace(passwordValue);
+            if (userPresent ^ passPresent)
+            {
+                return EmitAndReturnUpsert(new PushDiagnostic
+                {
+                    Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
+                    Registry = host,
+                    Username = userPresent ? usernameValue : null,
+                    Detail = "registry-username and registry-password resolved asymmetrically",
+                    RemediationHint = "credentials travel as a pair — set both or neither (ADR-005 §1)",
+                });
+            }
+            if (!userPresent && !passPresent)
+            {
+                continue;
+            }
+
+            if (!seen.Add((host, usernameValue!)))
+            {
+                continue;
+            }
+            anyCredentialled = true;
+
+            PrivateRegistryUpsertResult upsertResult;
+            try
+            {
+                upsertResult = await client.PrivateRegistries
+                    .UpsertAsync(host, usernameValue!, passwordValue!, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnUpsert(new PushDiagnostic
+                {
+                    Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
+                    Registry = host,
+                    Username = usernameValue,
+                    Detail = RedactPassword(ex.Message, passwordValue),
+                });
+            }
+
+            if (upsertResult.Kind != PrivateRegistryUpsertKind.Success)
+            {
+                return EmitAndReturnUpsert(new PushDiagnostic
+                {
+                    Symbol = PushSymbol.CoolifyRegistryUpsertFailed,
+                    Registry = host,
+                    Username = usernameValue,
+                    Detail = RedactPassword(upsertResult.ErrorMessage, passwordValue),
+                });
+            }
         }
 
         LastPushDiagnostic = null;
-        return RegistryUpsertOutcome.Ok();
+        return anyCredentialled ? RegistryUpsertOutcome.Ok() : RegistryUpsertOutcome.SkippedAnonymous();
+    }
+
+    /// <summary>
+    /// FT-014: collect the distinct set of <see cref="ContainerRegistryResource"/>s reachable
+    /// from the supplied workloads' registry edges, plus the shim default registry if the
+    /// <c>WithImageRegistry(...)</c> shim was called. Workloads contribute their explicit edge
+    /// or — when absent — the shim default.
+    /// </summary>
+    internal List<ContainerRegistryResource> CollectDistinctRegistries(IEnumerable<IResource> resources)
+    {
+        var distinct = new List<ContainerRegistryResource>();
+        var byName = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var resource in resources)
+        {
+            var registry = ResolveRegistryFor(resource);
+            if (registry is not null && byName.Add(registry.Name))
+            {
+                distinct.Add(registry);
+            }
+        }
+
+        // The shim's synthetic registry is always part of the distinct set when the shim
+        // was called — its presence is the developer's intent, even when no workload was
+        // explicitly attached (e.g. the resource set is empty / unwired in tests).
+        if (ShimDefaultRegistry is not null && byName.Add(ShimDefaultRegistry.Name))
+        {
+            distinct.Add(ShimDefaultRegistry);
+        }
+
+        return distinct;
+    }
+
+    /// <summary>
+    /// FT-014: locate the <see cref="ContainerRegistryResource"/> for a workload via the
+    /// explicit <c>WithContainerRegistry(...)</c> edge, falling back to the shim default
+    /// when no edge is present. Returns null when neither is available.
+    /// </summary>
+    internal ContainerRegistryResource? ResolveRegistryFor(IResource resource)
+    {
+        var explicitAnn = resource.Annotations
+            .OfType<ContainerRegistryReferenceAnnotation>()
+            .FirstOrDefault();
+        if (explicitAnn?.Registry is ContainerRegistryResource explicitResource)
+        {
+            return explicitResource;
+        }
+        return ShimDefaultRegistry;
+    }
+
+    /// <summary>
+    /// FT-014: resolve a registry resource's address — endpoint + optional repository path.
+    /// </summary>
+    internal static async Task<string> ResolveRegistryAddressAsync(
+        ContainerRegistryResource registry,
+        CancellationToken cancellationToken)
+    {
+        var icr = (Aspire.Hosting.ApplicationModel.IContainerRegistry)registry;
+        var endpoint = (await icr.Endpoint.GetValueAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+        if (string.IsNullOrEmpty(endpoint))
+        {
+            return string.Empty;
+        }
+        string? repository = null;
+        try
+        {
+            if (icr.Repository is not null)
+            {
+                repository = (await icr.Repository.GetValueAsync(cancellationToken).ConfigureAwait(false))?.Trim();
+            }
+        }
+        catch
+        {
+            repository = null;
+        }
+        return string.IsNullOrEmpty(repository)
+            ? endpoint
+            : endpoint.TrimEnd('/') + "/" + repository.TrimStart('/');
     }
 
     /// <summary>
@@ -894,42 +1024,8 @@ public sealed class CoolifyDeployingPublisher
         string? passwordValue = null;
         try
         {
-            // Step 2: resolve credentials (or confirm anonymous).
-            RegistryCredentials? credentials = null;
-            string? host = null;
-            if (RegistryPrefix is not null)
-            {
-                var prefixValue = (await RegistryPrefix.Resource.GetValueAsync(cancellationToken)
-                    .ConfigureAwait(false))?.Trim();
-                if (!string.IsNullOrEmpty(prefixValue))
-                {
-                    host = DeriveHost(prefixValue);
-                }
-            }
-
-            if (RegistryUsername is not null && RegistryPassword is not null)
-            {
-                var usernameValue = await RegistryUsername.Resource.GetValueAsync(cancellationToken)
-                    .ConfigureAwait(false);
-                passwordValue = await RegistryPassword.Resource.GetValueAsync(cancellationToken)
-                    .ConfigureAwait(false);
-                var userPresent = !string.IsNullOrWhiteSpace(usernameValue);
-                var passPresent = !string.IsNullOrWhiteSpace(passwordValue);
-                if (userPresent && passPresent)
-                {
-                    credentials = new RegistryCredentials(usernameValue!, passwordValue!);
-                }
-                else if (userPresent ^ passPresent)
-                {
-                    return EmitAndReturnPush(new PushDiagnostic
-                    {
-                        Symbol = PushSymbol.PushPhaseUnexpected,
-                        Detail = "registry-username and registry-password resolved asymmetrically",
-                    }, passwordValue);
-                }
-            }
-
-            // Step 3: per-resource push.
+            // FT-014 §D: per-resource push. Credentials follow the workload's registry edge
+            // (explicit annotation or shim default).
             var authFailures = new List<(string Resource, string Tag)>();
             var otherFailures = new List<(string Resource, string Tag)>();
             var pushed = new List<string>();
@@ -938,23 +1034,59 @@ public sealed class CoolifyDeployingPublisher
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                // I-5: read FT-003's tag, falling back to recomputation only if absent
-                // (e.g. push invoked stand-alone in a test). The recomputation uses the same
-                // algorithm so there is still no drift.
+                var registry = ResolveRegistryFor(resource);
+                string? host = null;
+                RegistryCredentials? credentials = null;
+                if (registry is not null)
+                {
+                    var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(address))
+                    {
+                        host = DeriveHost(address);
+                    }
+
+                    var credAnn = registry.Annotations
+                        .OfType<CoolifyRegistryCredentialsAnnotation>()
+                        .FirstOrDefault();
+                    if (credAnn is not null)
+                    {
+                        var usernameValue = await credAnn.Username.Resource.GetValueAsync(cancellationToken)
+                            .ConfigureAwait(false);
+                        passwordValue = await credAnn.Password.Resource.GetValueAsync(cancellationToken)
+                            .ConfigureAwait(false);
+                        var userPresent = !string.IsNullOrWhiteSpace(usernameValue);
+                        var passPresent = !string.IsNullOrWhiteSpace(passwordValue);
+                        if (userPresent && passPresent)
+                        {
+                            credentials = new RegistryCredentials(usernameValue!, passwordValue!);
+                        }
+                        else if (userPresent ^ passPresent)
+                        {
+                            return EmitAndReturnPush(new PushDiagnostic
+                            {
+                                Symbol = PushSymbol.PushPhaseUnexpected,
+                                Detail = "registry-username and registry-password resolved asymmetrically",
+                            }, passwordValue);
+                        }
+                    }
+                }
+
+                // I-5: read FT-003's tag, falling back to recomputation only if absent.
                 if (!_lastBuildTagsByResource.TryGetValue(resource.Name, out var tag))
                 {
-                    if (RegistryPrefix is null)
+                    if (registry is null)
                     {
                         return EmitAndReturnPush(new PushDiagnostic
                         {
                             Symbol = PushSymbol.PushPhaseUnexpected,
-                            Detail = "no image tag from build phase and no registry prefix to recompute from",
+                            Detail = "no image tag from build phase and no registry edge to recompute from",
                         }, passwordValue);
                     }
-                    var prefixValue = (await RegistryPrefix.Resource.GetValueAsync(cancellationToken)
-                        .ConfigureAwait(false))?.Trim() ?? "";
+                    var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
+                        .ConfigureAwait(false);
                     var (_, ver) = AppHostInfoProvider();
-                    tag = $"{prefixValue}/{resource.Name}:{ver?.Trim()}";
+                    tag = $"{address}/{resource.Name}:{ver?.Trim()}";
                 }
 
                 ImagePushResult result;
@@ -1000,7 +1132,6 @@ public sealed class CoolifyDeployingPublisher
                     Failures = authFailures,
                     AdditionalNonAuthFailures = otherFailures,
                     Registry = DeriveHostFromFailures(authFailures),
-                    Username = credentials?.Username,
                 }, passwordValue);
             }
             if (otherFailures.Count > 0)
@@ -1214,7 +1345,11 @@ public sealed class CoolifyDeployingPublisher
                 _lastBuildTagsByResource.TryGetValue(resource.Name, out var tag);
                 tag ??= ""; // No tag available — surface as failure detail via the upsert.
 
-                var registryReference = RegistryUsername is not null && RegistryPassword is not null
+                // FT-014: derive registry reference from the workload's registry edge.
+                var workloadRegistry = ResolveRegistryFor(resource);
+                var hasRegistryCreds = workloadRegistry is not null
+                    && workloadRegistry.Annotations.OfType<CoolifyRegistryCredentialsAnnotation>().Any();
+                var registryReference = hasRegistryCreds
                     ? $"{ResolveHostFromTag(tag)}|registry"
                     : null;
                 var spec = new ServiceSpec(

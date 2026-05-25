@@ -11,6 +11,7 @@ adrs:
 - ADR-001
 - ADR-004
 - ADR-006
+- ADR-007
 tests:
 - TC-007
 domains:
@@ -20,6 +21,22 @@ domains-acknowledged: {}
 ---
 
 ## Description
+
+> **ADR-007 amendment (FT-014).** The channel by which the build phase
+> reads the image-push target has been changed from the publisher-
+> instance `(prefix, username, password)` triple captured by
+> `WithImageRegistry(...)` to the Aspire 13 native channel:
+> `ContainerRegistryResource` declared with `AddContainerRegistry(...)`
+> and attached to workloads via the `WithContainerRegistry(...)` edge
+> in the resource graph. `WithImageRegistry(...)` survives as a
+> deprecated shim that synthesises that edge (see FT-014 §Behaviour
+> §0). The tag shape, the four `E_…` symbols, and every other
+> observable contract enumerated below are preserved verbatim. Where
+> this body refers to "the captured `prefix`" or to reading the
+> publisher-instance triple, treat the channel as restated against
+> the workload→registry edge per ADR-007 §Decision §1; the original
+> text is preserved below so the v1.x reference behaviour remains
+> readable.
 
 FT-003 fills in the **build phase** body that FT-001's skeleton left as
 a no-op. It is the first feature that actually walks the Aspire
@@ -45,7 +62,12 @@ prefix to tag with. Credential handles (`username`, `password`) are
 captured on the publisher instance at registration time but are
 **not read or dereferenced** in FT-003: they are FT-004's input.
 This mirrors how FT-001 captures `(url, token)` but does not read
-the token — FT-002 reads it later.
+the token — FT-002 reads it later. *(Per ADR-007 / FT-014, the
+extension is rewritten as a shim that synthesises an
+`AddContainerRegistry` + per-workload `WithContainerRegistry` edge;
+the build phase reads the prefix from the registry resource attached
+to each workload rather than from a publisher-instance field. The
+shim is marked `[Obsolete]`.)*
 
 The exit criteria are: (a) `WithImageRegistry(...)` registers
 correctly with the publisher and captures all three handles, (b)
@@ -78,7 +100,12 @@ in its diagnostic.
   `prefix` is required; `username` and `password` are optional and
   travel as a pair per ADR-005 §1. FT-003 reads only `prefix`;
   `username` and `password` are captured but never dereferenced by
-  this feature.
+  this feature. *(Per ADR-007 / FT-014: the publisher no longer
+  stores this triple as a field on its own instance — the prefix is
+  read from the `ContainerRegistryResource.Address` of the registry
+  attached to each workload via the `WithContainerRegistry(...)`
+  edge. The shim synthesises that edge for AppHosts that still call
+  `WithImageRegistry(...)`.)*
 - The Aspire resource graph reachable from the running
   `DistributedApplication` instance. FT-003 reads the graph through
   whatever enumeration API Aspire's `IDeployingPublisher` context
@@ -118,7 +145,7 @@ in its diagnostic.
 
   | Symbol                       | Stderr-visible literal        | Trigger                                                                              |
   |------------------------------|-------------------------------|--------------------------------------------------------------------------------------|
-  | `E_REGISTRY_NOT_CONFIGURED`  | `E_REGISTRY_NOT_CONFIGURED`   | `WithImageRegistry(...)` was not called, or `prefix` resolved to null/empty          |
+  | `E_REGISTRY_NOT_CONFIGURED`  | `E_REGISTRY_NOT_CONFIGURED`   | A workload has no `WithContainerRegistry(...)` edge in the resource graph and the deprecated shim did not synthesise one (per ADR-007). v1.x source-compat: `WithImageRegistry(...)` was not called or `prefix` resolved to null/empty. |
   | `E_APPHOST_VERSION_MISSING`  | `E_APPHOST_VERSION_MISSING`   | `AssemblyInformationalVersionAttribute` is absent or empty on the AppHost assembly   |
   | `E_IMAGE_BUILD_FAILED`       | `E_IMAGE_BUILD_FAILED`        | Aspire's image pipeline reported a non-zero exit / threw for any resource            |
   | `E_BUILD_PHASE_UNEXPECTED`   | `E_BUILD_PHASE_UNEXPECTED`    | Catch-all for unclassifiable failures inside the build phase body                    |
@@ -131,11 +158,14 @@ in its diagnostic.
     resource: <aspire-resource-name>          (for IMAGE_BUILD_FAILED / BUILD_PHASE_UNEXPECTED, when known)
     tag:      <prefix>/<resource>:<version>   (for IMAGE_BUILD_FAILED, when computed)
     apphost:  <AppHost assembly simple name>  (for APPHOST_VERSION_MISSING)
-    see:      ADR-005 §1                      (for REGISTRY_NOT_CONFIGURED)
+    see:      ADR-005 §1                      (for REGISTRY_NOT_CONFIGURED — also ADR-007 §Decision §1 for the new channel)
     remediation:
+      var reg = builder.AddContainerRegistry("name", "host/prefix");
+      workload.WithContainerRegistry(reg);                              (for REGISTRY_NOT_CONFIGURED — native shape)
+      // or (deprecated v1.x source-compat):
       builder.WithCoolifyDeploy(url, token)
-             .WithImageRegistry(prefix, [user, pass]);    (for REGISTRY_NOT_CONFIGURED)
-      [<Assembly: AssemblyInformationalVersion("1.0.0")>] (for APPHOST_VERSION_MISSING)
+             .WithImageRegistry(prefix, [user, pass]);                  (for REGISTRY_NOT_CONFIGURED — shim shape)
+      [<Assembly: AssemblyInformationalVersion("1.0.0")>]               (for APPHOST_VERSION_MISSING)
   ```
 
   The first whitespace-delimited token on the first line is the
@@ -162,7 +192,9 @@ in its diagnostic.
   captured `username` / `password` parameter handles **on the
   publisher instance** survive the build phase because they belong
   to FT-004's input contract; FT-003 does not read them and does
-  not clear them.
+  not clear them. *(Per ADR-007 / FT-014: after the channel change,
+  these handles live on the `ContainerRegistryResource` attached
+  to each workload, not on the publisher instance.)*
 - **Per-resource build progress is reported through Aspire's
   pipeline.** FT-003 does not maintain a parallel progress object;
   it observes the Aspire pipeline's progress events and re-emits
@@ -204,12 +236,28 @@ not iterate the resource graph.
    captured registry handles, and the build phase fails fast in
    step 1.
 
+   **Per ADR-007 / FT-014:** this extension is rewritten as a shim
+   that calls `AddContainerRegistry(syntheticName, prefix)` and
+   attaches every otherwise-unattached containerisable workload to
+   the resulting `ContainerRegistryResource` via
+   `WithContainerRegistry(...)`. The method is marked
+   `[Obsolete("Use AddContainerRegistry + WithContainerRegistry —
+   see ADR-007.", error: false)]`. The signature is unchanged.
+
 1. **Verify a registry prefix is configured.** Look at the
    publisher's captured `prefix` handle. If `WithImageRegistry(...)`
    was never called, or the captured `prefix` parameter resolves
    to null / empty (after trimming surrounding whitespace), fail-
    fast with `E_REGISTRY_NOT_CONFIGURED`. No image work is
    attempted, no graph walk is performed.
+
+   **Per ADR-007 / FT-014:** restated as "for each containerisable
+   workload, follow its `WithContainerRegistry(...)` edge to a
+   `ContainerRegistryResource`; if any workload has no edge (and
+   the shim did not synthesise one), fail-fast with
+   `E_REGISTRY_NOT_CONFIGURED` naming the offending workload(s).
+   The diagnostic's remediation block lists both the native shape
+   and the deprecated shim shape."
 
 2. **Resolve the AppHost version.** Read
    `AssemblyInformationalVersionAttribute` from the AppHost
@@ -243,7 +291,12 @@ not iterate the resource graph.
       naming rules already produce registry-safe names, and any
       deviation is the caller's problem to surface). The tag
       string is computed once per resource and reused for every
-      log line and for the Aspire pipeline call.
+      log line and for the Aspire pipeline call. *(Per ADR-007 /
+      FT-014: `<prefix>` is read from
+      `ContainerRegistryResource.Address` of the registry attached
+      to this workload via the `WithContainerRegistry(...)` edge,
+      not from a publisher-instance field. The shape — `<address>/
+      <resource.Name>:<apphost-version>` — is unchanged.)*
    2. Invoke Aspire's container-image build pipeline for this
       resource, passing the composed image tag as the
       authoritative `<image-name>:<tag>` for the build. The
@@ -302,7 +355,9 @@ an unknown state.
   digest, no environment tag, no per-deploy stamp. The shape is
   the observable contract that ADR-005 D4 fixes and that downstream
   features (FT-004 push, future Coolify deploy-phase) consume by
-  reading from the local image store.
+  reading from the local image store. *(Per ADR-007 / FT-014:
+  `<prefix>` is sourced from the registry resource's `Address`,
+  per workload; shape unchanged.)*
 - **I-2: no `latest` tag is emitted under any code path.** This
   is the load-bearing prohibition from ADR-005 §4 / §6 ("a
   `latest` tag is **not** pushed in v1") restated at the build
@@ -331,7 +386,10 @@ an unknown state.
   FT-003 must not call their value-resolution API. Asserted by
   injecting sentinel values into the `password` parameter and
   verifying the sentinel never reaches stdout, stderr, deploy logs,
-  or any HttpClient during a successful build phase.
+  or any HttpClient during a successful build phase. *(Per ADR-007
+  / FT-014: the credentials live on the `ContainerRegistryResource`
+  rather than the publisher instance, but the "captured-not-
+  dereferenced-in-build" discipline is unchanged.)*
 - **I-7: build failure refuses to advance to `push`.** Asserted by
   forcing one resource's image build to fail and verifying that
   no log line attributed to the `push` phase appears in the deploy
@@ -345,7 +403,12 @@ an unknown state.
   legitimately reconfigure their registry between local
   experiments. Asserted by calling the method twice with
   distinguishable prefixes and observing tags built against the
-  second prefix.
+  second prefix. *(Per ADR-007 / FT-014: the shim's
+  `syntheticName` is a deterministic function of the prefix, so
+  repeated calls with the same prefix converge on the same
+  `ContainerRegistryResource`; calls with a different prefix
+  produce a different synthetic resource and the workload edge is
+  re-attached.)*
 - **I-9: every fail-fast exit emits the build-phase boundary.**
   FT-001's phase-boundary logging shows `build: enter … build:
   exit (failed)` with no `push: enter` line. Asserted by deploy-
@@ -390,9 +453,12 @@ paths this feature introduces. Beyond them:
 - **In scope for FT-003:**
   - the `WithImageRegistry(prefix, username, password)` extension
     method (introduced here for the first time, fixed signature
-    per ADR-005 §1)
+    per ADR-005 §1; rewritten as a deprecated shim per ADR-007 /
+    FT-014 — signature still unchanged)
   - capturing the `(prefix, username, password)` handles on the
-    publisher instance at registration time
+    publisher instance at registration time *(ADR-007 / FT-014:
+    these now live on the synthesised
+    `ContainerRegistryResource`, not on the publisher)*
   - the build-phase body: registry-config check, AppHost-version
     read, per-resource loop driving Aspire's image pipeline
   - deterministic tag composition matching ADR-005 D4 exactly
@@ -433,6 +499,10 @@ paths this feature introduces. Beyond them:
   - retry / backoff on image-pipeline failures → single attempt;
     failure → fail-fast (matches FT-002's transport-failure
     discipline)
+  - the channel change to native `ContainerRegistryResource` +
+    `WithContainerRegistry` edge reads → **FT-014** (this body
+    annotates the amendment inline; FT-014 owns the
+    implementation)
 
 ## Out of scope
 
@@ -471,3 +541,6 @@ paths this feature introduces. Beyond them:
   build phase emits structured log entries per resource; that is
   the only progress channel FT-003 introduces. A future feature
   may layer richer reporting on top.
+- **The publisher-instance triple read path.** Superseded by
+  ADR-007 / FT-014's native channel; the triple no longer lives as
+  a field on `CoolifyDeployingPublisher` after FT-014 lands.

@@ -4,6 +4,8 @@ title: Central Package Management scope — src/ and tests/ only, examples/ opt-
 status: accepted
 features:
 - FT-012
+- FT-014
+- FT-015
 supersedes: []
 superseded-by: []
 domains: []

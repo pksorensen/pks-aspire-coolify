@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <NoWarn>$(NoWarn);ASPIREPIPELINES001</NoWarn>
+    <NoWarn>$(NoWarn);ASPIREPIPELINES001;ASPIRECOMPUTE003</NoWarn>
 
     <IsPackable>true</IsPackable>
     <PackageId>Aspire.Hosting.Coolify</PackageId>
