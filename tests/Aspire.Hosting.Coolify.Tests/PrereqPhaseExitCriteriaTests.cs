@@ -182,6 +182,7 @@ public sealed class PrereqPhaseExitCriteriaTests
         var stderr = new StringWriter();
         publisher.ErrorWriter = stderr;
         publisher.AppHostInfoProvider = () => ("Test.AppHost", "1.0.0");
+        publisher.DockerLoginEnabled = false;
         return (b, publisher, client, probe, stderr);
     }
 

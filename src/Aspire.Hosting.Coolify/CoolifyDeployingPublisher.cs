@@ -322,6 +322,14 @@ public sealed class CoolifyDeployingPublisher
     public IImagePushPipeline ImagePushPipeline { get; set; } = new UnconfiguredImagePushPipeline();
 
     /// <summary>
+    /// FT-017 §C: when true, the prereq phase writes the registry's owner credentials into
+    /// <c>~/.docker/config.json</c> so subsequent workload pushes find them. Tests set this
+    /// to false to avoid polluting the developer's real docker config; the real publisher
+    /// pipeline leaves it on so pushes actually authenticate.
+    /// </summary>
+    public bool DockerLoginEnabled { get; set; } = true;
+
+    /// <summary>
     /// Source of the resource set to iterate in the push phase. FT-004 §Push §1: push
     /// receives the same resource set the build phase iterated; v1 reuses
     /// <see cref="ResourcesToBuild"/> when this is unset.
@@ -1368,34 +1376,31 @@ public sealed class CoolifyDeployingPublisher
             }
             catch { /* best-effort; old behavior falls back to static localhost: address */ }
 
-            // FT-017 §C: docker login so the subsequent push phase finds the creds in
-            // ~/.docker/config.json. Aspire's IResourceContainerImageManager doesn't
-            // accept Username explicitly; relying on docker's credential cache is the
-            // idiomatic path.
+            // FT-017 §C: plant the owner's basic-auth creds in ~/.docker/config.json so
+            // Aspire's IResourceContainerImageManager push finds them. Writing the file
+            // directly (rather than shelling to `docker login`) bypasses any broken
+            // credsStore helpers — devcontainers ship a credential helper that gets
+            // wiped on container restart and silently swallows login writes.
+            if (!DockerLoginEnabled)
+            {
+                continue;
+            }
             try
             {
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "docker",
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                };
-                psi.ArgumentList.Add("login");
-                psi.ArgumentList.Add(fqdn);
-                psi.ArgumentList.Add("-u");
-                psi.ArgumentList.Add(ownerName);
-                psi.ArgumentList.Add("--password-stdin");
-                using var proc = System.Diagnostics.Process.Start(psi);
-                if (proc is not null)
-                {
-                    await proc.StandardInput.WriteAsync(ownerPwd).ConfigureAwait(false);
-                    proc.StandardInput.Close();
-                    await proc.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-                }
+                WriteDockerAuthEntry(fqdn, ownerName, ownerPwd);
             }
-            catch { /* tolerable — push phase will surface auth error if login failed */ }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Fqdn = fqdn,
+                    Detail = $"writing ~/.docker/config.json auth entry for {fqdn} failed: {ex.GetType().Name}: {ex.Message}",
+                });
+            }
         }
 
         // §5 — record per-workload attachment map from the resource graph's
@@ -1434,6 +1439,52 @@ public sealed class CoolifyDeployingPublisher
 
     private static string RandomHex32() => System.Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
     private static string RandomHex16() => System.Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
+
+    /// <summary>
+    /// FT-017 §C: directly write a Docker basic-auth entry into <c>~/.docker/config.json</c>,
+    /// equivalent to <c>docker login &lt;fqdn&gt; -u &lt;user&gt; -p &lt;pwd&gt;</c> but bypassing any
+    /// <c>credsStore</c> credential helper (devcontainers ship one that resets on container
+    /// restart and silently eats login writes). Existing entries for other hosts are preserved.
+    /// </summary>
+    private static void WriteDockerAuthEntry(string host, string user, string password)
+    {
+        var configPath = System.IO.Path.Combine(
+            System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile),
+            ".docker", "config.json");
+        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(configPath)!);
+
+        // Read-modify-write: preserve unrelated `auths` entries and other top-level keys
+        // (e.g. `proxies`, `experimental`). credsStore stays out of our way because we always
+        // write the auth blob ourselves; docker push reads auths[host].auth verbatim.
+        System.Text.Json.Nodes.JsonObject root;
+        if (System.IO.File.Exists(configPath))
+        {
+            try
+            {
+                var existing = System.Text.Json.Nodes.JsonNode.Parse(System.IO.File.ReadAllText(configPath));
+                root = existing as System.Text.Json.Nodes.JsonObject ?? new System.Text.Json.Nodes.JsonObject();
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                root = new System.Text.Json.Nodes.JsonObject();
+            }
+        }
+        else
+        {
+            root = new System.Text.Json.Nodes.JsonObject();
+        }
+
+        if (root["auths"] is not System.Text.Json.Nodes.JsonObject auths)
+        {
+            auths = new System.Text.Json.Nodes.JsonObject();
+            root["auths"] = auths;
+        }
+        var b64 = System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes($"{user}:{password}"));
+        auths[host] = new System.Text.Json.Nodes.JsonObject { ["auth"] = b64 };
+
+        System.IO.File.WriteAllText(configPath, root.ToJsonString(
+            new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    }
 
     /// <summary>
     /// FT-014: collect the distinct set of <see cref="ContainerRegistryResource"/>s reachable

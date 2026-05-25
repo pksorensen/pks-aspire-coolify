@@ -484,14 +484,24 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                 //   project_uuid (req), server_uuid (req), destination_uuid, environment_uuid|name,
                 //   name, docker_registry_image_name, docker_registry_image_tag, ports_exposes
                 //
-                // 1. Look up existing application with this name to make the upsert idempotent.
-                var existing = await _c.SendForJsonAsync<List<AppListItem>>(
-                    HttpMethod.Get, "api/v1/applications", body: null, ct)
-                    .ConfigureAwait(false);
-
-                if (existing is not null)
+                // 1. Look up existing application with this name scoped to (project, env). The
+                // global /applications list is project-blind and returned a sibling project's
+                // app with the same name (see ProvisionRegistryAsync for the same fix).
+                List<EnvAppItem>? existingApps = null;
+                try
                 {
-                    var match = existing.FirstOrDefault(a => string.Equals(a.Name, resourceName, StringComparison.OrdinalIgnoreCase));
+                    var envDetail = await _c.SendForJsonAsync<EnvDetailBody>(
+                        HttpMethod.Get,
+                        $"api/v1/projects/{Uri.EscapeDataString(projectId)}/{Uri.EscapeDataString(environmentId)}",
+                        body: null, ct).ConfigureAwait(false);
+                    existingApps = envDetail?.Applications;
+                }
+                catch (CoolifyTransportException) { /* tolerate; falls through to create */ }
+                catch (CoolifyUnparseableResponseException) { /* tolerate */ }
+
+                if (existingApps is not null)
+                {
+                    var match = existingApps.FirstOrDefault(a => string.Equals(a.Name, resourceName, StringComparison.OrdinalIgnoreCase));
                     if (match is not null && !string.IsNullOrEmpty(match.Uuid))
                     {
                         // FT-005 §"Managed-field set": image + tag are managed — PATCH the app so
@@ -1178,18 +1188,6 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             [property: JsonPropertyName("uuid")] string? Uuid,
             [property: JsonPropertyName("name")] string? Name);
 
-        // Shape returned by GET /api/v1/projects/{projectUuid}/{envUuid} — applications
-        // nested inside the environment view, scoped to (project, env) for collision-free
-        // idempotency lookups. ProvisionRegistryAsync uses this in place of the global
-        // /applications list which was project-blind.
-        private sealed record EnvDetailBody(
-            [property: JsonPropertyName("uuid")] string? Uuid,
-            [property: JsonPropertyName("name")] string? Name,
-            [property: JsonPropertyName("applications")] List<EnvAppItem>? Applications);
-
-        private sealed record EnvAppItem(
-            [property: JsonPropertyName("uuid")] string? Uuid,
-            [property: JsonPropertyName("name")] string? Name);
 
         private sealed record DockerImageAppBody2(
             [property: JsonPropertyName("name")] string Name,
@@ -1243,4 +1241,18 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
     }
 
     private sealed record NamedBody([property: JsonPropertyName("name")] string Name);
+
+    // Shape returned by GET /api/v1/projects/{projectUuid}/{envUuid} — applications nested
+    // inside the environment view. Shared by ProvisionRegistryAsync (registry-app) and
+    // HttpServicesApi.UpsertAsync (workload-app) to scope existing-app lookups to (project,
+    // env) instead of the project-blind global /applications list, which returns sibling
+    // projects' apps with the same name.
+    internal sealed record EnvDetailBody(
+        [property: JsonPropertyName("uuid")] string? Uuid,
+        [property: JsonPropertyName("name")] string? Name,
+        [property: JsonPropertyName("applications")] List<EnvAppItem>? Applications);
+
+    internal sealed record EnvAppItem(
+        [property: JsonPropertyName("uuid")] string? Uuid,
+        [property: JsonPropertyName("name")] string? Name);
 }
