@@ -29,6 +29,20 @@ public interface IApplicationsApi
     Task<ApplicationDeployResult> TriggerAndAwaitAsync(
         string applicationUuid,
         CancellationToken cancellationToken);
+
+    /// <summary>FT-017: upserts environment variables on the application via Coolify's <c>/envs</c> endpoint.</summary>
+    Task<ApplicationProvisionResult> UpsertEnvironmentVariablesAsync(
+        string applicationUuid,
+        IReadOnlyDictionary<string, string> envs,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(new ApplicationProvisionResult(false, applicationUuid, null, null, null,
+            "env-upsert not implemented on this client"));
+
+    /// <summary>FT-017: creates an owner on a deployed pks-agent-registry via its mgmt API.</summary>
+    Task<OwnerProvisionResult> ProvisionOwnerAsync(
+        OwnerProvisionRequest request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(new OwnerProvisionResult(false, "owner provisioning not implemented on this client"));
 }
 
 /// <summary>Input record for <see cref="IApplicationsApi.ProvisionRegistryAsync"/>.</summary>
@@ -38,7 +52,16 @@ public sealed record ApplicationProvisionRequest(
     string EnvironmentName,
     string Image,
     int Port,
-    string? DestinationName = null);
+    string? DestinationName = null,
+    IReadOnlyDictionary<string, string>? EnvironmentVariables = null);
+
+/// <summary>
+/// FT-017: pks-agent-registry owner provisioning via <c>POST /_mgmt/owners</c>.
+/// Returns owner credentials sibling workloads use as docker-push basic-auth.
+/// </summary>
+public sealed record OwnerProvisionRequest(string Fqdn, string AdminToken, string OwnerName, string OwnerPassword);
+
+public sealed record OwnerProvisionResult(bool Succeeded, string? ErrorMessage);
 
 /// <summary>Outcome of <see cref="IApplicationsApi.ProvisionRegistryAsync"/>.</summary>
 public sealed record ApplicationProvisionResult(

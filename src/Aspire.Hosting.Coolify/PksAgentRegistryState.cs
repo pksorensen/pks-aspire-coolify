@@ -29,4 +29,13 @@ public sealed class PksAgentRegistryState
 
     /// <summary>Coolify project UUID under which the registry Application lives.</summary>
     public string? ProjectUuid { get; set; }
+
+    /// <summary>FT-017: admin-token planted as <c>REGISTRY_ADMIN_TOKEN</c> env on the registry app.</summary>
+    public string? AdminToken { get; set; }
+
+    /// <summary>FT-017: pks-agent-registry owner provisioned via <c>/_mgmt/owners</c> after deploy.</summary>
+    public string? OwnerName { get; set; }
+
+    /// <summary>FT-017: owner password (random per-deploy) used as docker-login basic-auth for sibling pushes.</summary>
+    public string? OwnerPassword { get; set; }
 }

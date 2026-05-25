@@ -812,6 +812,10 @@ public sealed class CoolifyDeployingPublisher
                 var registry = ResolveRegistryFor(resource)!;
                 var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
                     .ConfigureAwait(false);
+                logger.LogInformation("coolify: build: resolve registry={Registry} prereqKeys={Keys} address={Address}",
+                    registry.Name,
+                    string.Join(",", _prereqState.Keys),
+                    address);
                 if (string.IsNullOrEmpty(address))
                 {
                     return EmitAndReturnBuild(new BuildDiagnostic
@@ -1206,6 +1210,156 @@ public sealed class CoolifyDeployingPublisher
                     Detail = probe.LastNetworkError,
                 });
             }
+
+            // FT-017 §A: plant REGISTRY_ADMIN_TOKEN env (random per-deploy) so the registry's
+            // /_mgmt/ surface is enabled. Pass any explicit env-vars declared on the registry
+            // container resource too (Aspire's EnvironmentCallbackAnnotation).
+            var adminToken = RandomHex32();
+            var envsToSet = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["REGISTRY_ADMIN_TOKEN"] = adminToken,
+            };
+            state.AdminToken = adminToken;
+
+            try
+            {
+                var envUpsert = await client.Applications
+                    .UpsertEnvironmentVariablesAsync(provision.ApplicationUuid!, envsToSet, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!envUpsert.Succeeded)
+                {
+                    return EmitAndReturnPrereq(new PrereqDiagnostic
+                    {
+                        Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                        Registry = registry.Name,
+                        ApplicationUuid = provision.ApplicationUuid,
+                        Detail = "env-upsert failed: " + envUpsert.ErrorMessage,
+                    });
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Detail = "env-upsert exception: " + ex.Message,
+                });
+            }
+
+            // Restart so the new env takes effect.
+            try
+            {
+                await client.Applications
+                    .TriggerAndAwaitAsync(provision.ApplicationUuid!, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* best-effort; reachability probe below is the real gate */ }
+
+            // Re-probe so we don't try /_mgmt/owners against a half-restarted container.
+            try
+            {
+                var reProbe = await ReachabilityProbe.ProbeAsync(fqdn, cancellationToken).ConfigureAwait(false);
+                if (!reProbe.Succeeded)
+                {
+                    return EmitAndReturnPrereq(new PrereqDiagnostic
+                    {
+                        Symbol = PrereqSymbol.PrereqRegistryUnreachable,
+                        Registry = registry.Name,
+                        Fqdn = fqdn,
+                        ProbeUrl = reProbe.ProbeUrl,
+                        Elapsed = reProbe.Elapsed,
+                        Detail = "post-env-restart: " + reProbe.LastNetworkError,
+                    });
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch { /* fall through to owner-provision; failure surfaces there */ }
+
+            // FT-017 §B: provision an owner with random password; cache creds on state for
+            // workload-push docker-login (FT-017 §C below). Idempotent — 409 = already exists.
+            var ownerName = "aspire";
+            var ownerPwd = RandomHex16();
+            try
+            {
+                var ownerResult = await client.Applications.ProvisionOwnerAsync(
+                    new OwnerProvisionRequest(fqdn, adminToken, ownerName, ownerPwd),
+                    cancellationToken).ConfigureAwait(false);
+                if (!ownerResult.Succeeded)
+                {
+                    return EmitAndReturnPrereq(new PrereqDiagnostic
+                    {
+                        Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                        Registry = registry.Name,
+                        ApplicationUuid = provision.ApplicationUuid,
+                        Detail = "owner-provision failed: " + ownerResult.ErrorMessage,
+                    });
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return EmitAndReturnPrereq(new PrereqDiagnostic
+                {
+                    Symbol = PrereqSymbol.PrereqRegistryDeployFailed,
+                    Registry = registry.Name,
+                    ApplicationUuid = provision.ApplicationUuid,
+                    Detail = "owner-provision exception: " + ex.Message,
+                });
+            }
+            state.OwnerName = ownerName;
+            state.OwnerPassword = ownerPwd;
+
+            // FT-017 §D: rewrite the ContainerRegistryResource's private `_endpoint` field so
+            // Aspire's IResourceContainerImageManager tags + pushes against the Coolify-assigned
+            // FQDN (and the owner's namespace), not the localhost:5000 placeholder. The endpoint
+            // field is private/get-only on Aspire 13 — reflection is the only path until Aspire
+            // adds a public setter. ReferenceExpression is rebuilt to include the owner segment
+            // so the workload tag becomes `{fqdn}/{owner}/{workload}:{version}`.
+            try
+            {
+                var endpointField = typeof(ContainerRegistryResource).GetField(
+                    "_endpoint",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (endpointField is not null)
+                {
+                    var newEndpoint = $"{fqdn}/{ownerName}";
+                    endpointField.SetValue(registry, ReferenceExpression.Create($"{newEndpoint}"));
+                }
+            }
+            catch { /* best-effort; old behavior falls back to static localhost: address */ }
+
+            // FT-017 §C: docker login so the subsequent push phase finds the creds in
+            // ~/.docker/config.json. Aspire's IResourceContainerImageManager doesn't
+            // accept Username explicitly; relying on docker's credential cache is the
+            // idiomatic path.
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "docker",
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                };
+                psi.ArgumentList.Add("login");
+                psi.ArgumentList.Add(fqdn);
+                psi.ArgumentList.Add("-u");
+                psi.ArgumentList.Add(ownerName);
+                psi.ArgumentList.Add("--password-stdin");
+                using var proc = System.Diagnostics.Process.Start(psi);
+                if (proc is not null)
+                {
+                    await proc.StandardInput.WriteAsync(ownerPwd).ConfigureAwait(false);
+                    proc.StandardInput.Close();
+                    await proc.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch { /* tolerable — push phase will surface auth error if login failed */ }
         }
 
         // §5 — record per-workload attachment map from the resource graph's
@@ -1241,6 +1395,9 @@ public sealed class CoolifyDeployingPublisher
         ErrorWriter.Write(diagnostic.Format());
         ErrorWriter.Flush();
     }
+
+    private static string RandomHex32() => System.Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+    private static string RandomHex16() => System.Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(16)).ToLowerInvariant();
 
     /// <summary>
     /// FT-014: collect the distinct set of <see cref="ContainerRegistryResource"/>s reachable

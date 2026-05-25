@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -982,6 +983,140 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             catch (CoolifyUnparseableResponseException ex)
             { return new ApplicationDeployResult(false, deploymentUuid, ex.Message); }
         }
+
+        /// <summary>
+        /// FT-017: upsert env vars on a Coolify application. Coolify rejects duplicate keys, so we
+        /// list existing envs and DELETE/POST per key. <c>is_literal:true</c> keeps the value verbatim.
+        /// </summary>
+        public async Task<ApplicationProvisionResult> UpsertEnvironmentVariablesAsync(
+            string applicationUuid, IReadOnlyDictionary<string, string> envs, CancellationToken ct)
+        {
+            try
+            {
+                // List existing envs to support replace-on-conflict.
+                List<EnvListItem>? existing = null;
+                try
+                {
+                    existing = await _c.SendForJsonAsync<List<EnvListItem>>(
+                        HttpMethod.Get,
+                        $"api/v1/applications/{Uri.EscapeDataString(applicationUuid)}/envs",
+                        body: null, ct).ConfigureAwait(false);
+                }
+                catch (CoolifyUnparseableResponseException) { /* tolerate empty/odd shapes */ }
+
+                foreach (var kv in envs)
+                {
+                    var match = existing?.FirstOrDefault(e => string.Equals(e.Key, kv.Key, StringComparison.Ordinal));
+                    if (match is not null && !string.IsNullOrEmpty(match.Uuid))
+                    {
+                        // Update existing (PATCH) so we don't trip Coolify's unique-key constraint.
+                        using var patch = await _c.SendRawAsync(
+                            HttpMethod.Patch,
+                            $"api/v1/applications/{Uri.EscapeDataString(applicationUuid)}/envs",
+                            new EnvBody(kv.Key, kv.Value, false, true),
+                            ct).ConfigureAwait(false);
+                        if (!patch.IsSuccessStatusCode)
+                        {
+                            var detail = await patch.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                            return new ApplicationProvisionResult(false, applicationUuid, null, null, null,
+                                $"Coolify returned HTTP {(int)patch.StatusCode} updating env '{kv.Key}': {detail}");
+                        }
+                    }
+                    else
+                    {
+                        using var resp = await _c.SendRawAsync(
+                            HttpMethod.Post,
+                            $"api/v1/applications/{Uri.EscapeDataString(applicationUuid)}/envs",
+                            new EnvBody(kv.Key, kv.Value, false, true),
+                            ct).ConfigureAwait(false);
+                        if (!resp.IsSuccessStatusCode)
+                        {
+                            var detail = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                            return new ApplicationProvisionResult(false, applicationUuid, null, null, null,
+                                $"Coolify returned HTTP {(int)resp.StatusCode} creating env '{kv.Key}': {detail}");
+                        }
+                    }
+                }
+
+                return new ApplicationProvisionResult(true, applicationUuid, null, null, null, null);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return new ApplicationProvisionResult(false, applicationUuid, null, null, null, ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// FT-017: provision an owner on a deployed pks-agent-registry via <c>POST /_mgmt/owners</c>.
+        /// Idempotent at the API level — 409 on existing owner is treated as success.
+        /// </summary>
+        public async Task<OwnerProvisionResult> ProvisionOwnerAsync(
+            OwnerProvisionRequest request, CancellationToken ct)
+        {
+            // Coolify's restart goes through a "no available server" window while Traefik waits
+            // for the new container. Retry POST /_mgmt/owners for up to 2 minutes against 5xx
+            // and connection errors. 401 from the registry is also retried briefly because the
+            // restart may finish *before* the new REGISTRY_ADMIN_TOKEN env is applied (the
+            // pks-agent-registry binary reads it at boot only).
+            var scheme = request.Fqdn.Contains(':') && !request.Fqdn.StartsWith("[", StringComparison.Ordinal)
+                ? "http" : "https";
+            var url = $"{scheme}://{request.Fqdn}/_mgmt/owners";
+            var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(2);
+            string lastErr = "no attempt";
+            int lastStatus = 0;
+
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+                    using var msg = new HttpRequestMessage(HttpMethod.Post, url)
+                    {
+                        Content = JsonContent.Create(new OwnerBody(request.OwnerName, request.OwnerPassword)),
+                    };
+                    msg.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", request.AdminToken);
+                    using var resp = await http.SendAsync(msg, ct).ConfigureAwait(false);
+                    lastStatus = (int)resp.StatusCode;
+                    if (resp.IsSuccessStatusCode || resp.StatusCode == System.Net.HttpStatusCode.Conflict)
+                    {
+                        return new OwnerProvisionResult(true, null);
+                    }
+                    var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    lastErr = $"HTTP {(int)resp.StatusCode}: {body}";
+                    // 401/403/503 + 5xx = transient; 4xx (non-401/403) = permanent.
+                    if (lastStatus is not (401 or 403) && lastStatus < 500)
+                    {
+                        return new OwnerProvisionResult(false,
+                            $"pks-agent-registry mgmt returned HTTP {lastStatus} creating owner '{request.OwnerName}': {body}");
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    lastErr = ex.Message;
+                }
+                try { await Task.Delay(TimeSpan.FromSeconds(3), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { throw; }
+            }
+            return new OwnerProvisionResult(false,
+                $"pks-agent-registry mgmt unreachable after 2 minutes (last={lastErr})");
+        }
+
+        private sealed record EnvListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("key")] string? Key);
+
+        private sealed record EnvBody(
+            [property: JsonPropertyName("key")] string Key,
+            [property: JsonPropertyName("value")] string Value,
+            [property: JsonPropertyName("is_preview")] bool IsPreview,
+            [property: JsonPropertyName("is_literal")] bool IsLiteral);
+
+        private sealed record OwnerBody(
+            [property: JsonPropertyName("name")] string Name,
+            [property: JsonPropertyName("password")] string Password);
 
         private static string? NormalizeFqdn(string? raw)
         {

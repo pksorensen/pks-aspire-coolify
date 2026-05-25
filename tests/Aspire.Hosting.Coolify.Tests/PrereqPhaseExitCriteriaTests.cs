@@ -80,6 +80,16 @@ public sealed class PrereqPhaseExitCriteriaTests
             TriggerCalls.Add(applicationUuid);
             return Task.FromResult(TriggerImpl(applicationUuid));
         }
+
+        // FT-017: tests treat env-upsert + owner-provision as no-op-success — the real flow
+        // is exercised end-to-end against a live Coolify by manual smoke runs.
+        public Task<ApplicationProvisionResult> UpsertEnvironmentVariablesAsync(
+            string applicationUuid, IReadOnlyDictionary<string, string> envs, CancellationToken ct) =>
+            Task.FromResult(new ApplicationProvisionResult(true, applicationUuid, null, null, null, null));
+
+        public Task<OwnerProvisionResult> ProvisionOwnerAsync(
+            OwnerProvisionRequest request, CancellationToken ct) =>
+            Task.FromResult(new OwnerProvisionResult(true, null));
     }
 
     private sealed class FakeProbe : IRegistryReachabilityProbe
@@ -192,7 +202,8 @@ public sealed class PrereqPhaseExitCriteriaTests
         Assert.False(outcome.Skipped);
         Assert.Equal(1, publisher.LastPrereqVisitedCount);
         Assert.Single(client.Apps.ProvisionCalls);
-        Assert.Single(client.Apps.TriggerCalls);
+        // FT-017: trigger fires twice — once for initial deploy, once for the post-env restart.
+        Assert.Equal(2, client.Apps.TriggerCalls.Count);
     }
 
     [Fact]
@@ -208,7 +219,8 @@ public sealed class PrereqPhaseExitCriteriaTests
         Assert.True(outcome.Succeeded);
         Assert.Equal(2, publisher.LastPrereqVisitedCount);
         Assert.Equal(2, client.Apps.ProvisionCalls.Count);
-        Assert.Equal(2, client.Apps.TriggerCalls.Count);
+        // FT-017: 2 registries × (deploy + restart) = 4 trigger calls.
+        Assert.Equal(4, client.Apps.TriggerCalls.Count);
     }
 
     // ────────────────────────────────────────────────────────────────────────
