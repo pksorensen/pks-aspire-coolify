@@ -397,7 +397,10 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                var path = $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments/{Uri.EscapeDataString(name)}";
+                // Coolify v4 GET is /api/v1/projects/{uuid}/{env_name_or_uuid} — NO /environments/
+                // segment (see routes/api.php in coollabsio/coolify). POST stays at
+                // /api/v1/projects/{uuid}/environments which is handled by the create branch below.
+                var path = $"api/v1/projects/{Uri.EscapeDataString(projectId)}/{Uri.EscapeDataString(name)}";
                 using var get = await _c.SendRawAsync(HttpMethod.Get, path, body: null, ct).ConfigureAwait(false);
                 if (get.IsSuccessStatusCode)
                 {
