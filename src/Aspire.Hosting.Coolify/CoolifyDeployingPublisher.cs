@@ -699,12 +699,20 @@ public sealed class CoolifyDeployingPublisher
             // registry-edge gate without re-enumerating a stateful provider.
             var resourceList = resources.ToList();
 
-            // FT-014 §A: verify every containerisable workload has a registry edge.
-            // Workloads with neither an explicit ContainerRegistryReferenceAnnotation nor
-            // a shim-synthesised default fail fast with E_REGISTRY_NOT_CONFIGURED.
+            // FT-014 §A: verify every workload that needs to be BUILT has a registry
+            // edge. Resources that reference a pre-existing image (AddContainer without
+            // IProjectMetadata) don't need building, don't need pushing, and therefore
+            // don't need a registry edge — Coolify can pull their image directly from
+            // wherever it's hosted (Docker Hub, GHCR, etc.). This is the same heuristic
+            // the build pipeline already uses to no-op for non-project resources.
             var unattached = new List<string>();
             foreach (var resource in resourceList)
             {
+                var needsBuild = resource.Annotations.OfType<IProjectMetadata>().Any();
+                if (!needsBuild)
+                {
+                    continue; // pre-existing image — no registry edge required
+                }
                 if (ResolveRegistryFor(resource) is null)
                 {
                     unattached.Add(resource.Name);
@@ -739,6 +747,15 @@ public sealed class CoolifyDeployingPublisher
             foreach (var resource in resourceList)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // Pre-existing-image resources (AddContainer) don't need build/tag/push —
+                // skip the same way the registry-edge gate does. Their image annotation
+                // already names a real, pullable image; deploy phase will tell Coolify
+                // about it directly.
+                if (!resource.Annotations.OfType<IProjectMetadata>().Any())
+                {
+                    continue;
+                }
 
                 var registry = ResolveRegistryFor(resource)!;
                 var address = await ResolveRegistryAddressAsync(registry, cancellationToken)
@@ -1047,6 +1064,13 @@ public sealed class CoolifyDeployingPublisher
             foreach (var resource in resources)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // Pre-existing-image resources (AddContainer) don't need pushing — same
+                // skip as build phase. They reference an already-pullable image.
+                if (!resource.Annotations.OfType<IProjectMetadata>().Any())
+                {
+                    continue;
+                }
 
                 var registry = ResolveRegistryFor(resource);
                 string? host = null;
@@ -1364,6 +1388,21 @@ public sealed class CoolifyDeployingPublisher
                 cancellationToken.ThrowIfCancellationRequested();
 
                 _lastBuildTagsByResource.TryGetValue(resource.Name, out var tag);
+                if (string.IsNullOrEmpty(tag))
+                {
+                    // Pre-existing-image resource (AddContainer without IProjectMetadata)
+                    // — no build, no push, but the image annotation already names a real,
+                    // pullable image. Use it verbatim as the tag for the Coolify service.
+                    var imageAnn = resource.Annotations
+                        .OfType<ContainerImageAnnotation>()
+                        .FirstOrDefault();
+                    if (imageAnn is not null && !string.IsNullOrEmpty(imageAnn.Image))
+                    {
+                        tag = string.IsNullOrEmpty(imageAnn.Tag)
+                            ? imageAnn.Image
+                            : $"{imageAnn.Image}:{imageAnn.Tag}";
+                    }
+                }
                 tag ??= ""; // No tag available — surface as failure detail via the upsert.
 
                 // FT-014: derive registry reference from the workload's registry edge.
