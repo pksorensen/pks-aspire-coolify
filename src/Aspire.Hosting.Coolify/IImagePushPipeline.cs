@@ -1,12 +1,15 @@
+using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Publishing;
+using Microsoft.Extensions.DependencyInjection;
+
 // Implements ADR-005: Image registry strategy — explicit publisher-push to a developer-chosen registry (v1)
 namespace Aspire.Hosting.Coolify;
 
 /// <summary>
-/// FT-004 boundary onto Aspire's container-image push infrastructure (ADR-005 §D3). The push
-/// phase reads the deterministic per-resource tag emitted by FT-003 and delegates the actual
-/// upload to this pipeline. <see cref="RegistryCredentials"/> may be null for anonymous push.
-/// Implementations never throw for HTTP-level failures: those are folded into
-/// <see cref="ImagePushResult"/>.
+/// FT-004 boundary onto Aspire's container-image push infrastructure. Push happens after
+/// the build phase has produced a local image, before the deploy phase tells Coolify
+/// about it. Returns a structured result so the publisher can distinguish auth failures
+/// from transport failures and emit the right diagnostic.
 /// </summary>
 public interface IImagePushPipeline
 {
@@ -16,10 +19,12 @@ public interface IImagePushPipeline
         CancellationToken cancellationToken);
 }
 
-/// <summary>Resolved registry credentials handed to the push pipeline (FT-004 §Push §2).</summary>
+/// <summary>
+/// Credentials for a registry push. Either both <see cref="Username"/> and
+/// <see cref="Password"/> are set (authenticated push) or neither is (anonymous push).
+/// </summary>
 public sealed record RegistryCredentials(string Username, string Password);
 
-/// <summary>Classified push outcome. Exactly one kind per call.</summary>
 public sealed record ImagePushResult
 {
     private ImagePushResult() { }
@@ -44,16 +49,63 @@ public enum ImagePushResultKind
     Failed,
 }
 
+/// <summary>
+/// Default image-push pipeline: delegates to Aspire's canonical
+/// <see cref="IResourceContainerImageManager"/>, which honours the
+/// <c>WithContainerRegistry</c> + <c>WithImagePushOptions</c> annotations FT-014 wires.
+/// Falls back to no-op-succeed when no <see cref="IServiceProvider"/> has been plumbed
+/// in (test / non-pipeline context).
+/// </summary>
 internal sealed class UnconfiguredImagePushPipeline : IImagePushPipeline
 {
-    // Smoke-test fallback: no-op succeed. FT-004 only spec'd the orchestration; the
-    // real `docker push` integration is a separate follow-up FT. The publisher records
-    // the tag computed in build and trusts a real image is already available at that
-    // tag (true for AddContainer resources where Aspire annotates a public image;
-    // not true for AddProject without external build+push glue).
-    public Task<ImagePushResult> PushAsync(
+    internal IServiceProvider? AspireServices { get; set; }
+
+    /// <summary>
+    /// The resource whose image is being pushed in this step. Set by
+    /// <see cref="CoolifyDeployingPublisher.RunPushAsync"/> right before invocation so
+    /// the manager has the right resource handle (Aspire pushes by resource, not by tag).
+    /// </summary>
+    internal IResource? CurrentResource { get; set; }
+
+    public async Task<ImagePushResult> PushAsync(
         string imageTag,
         RegistryCredentials? credentials,
-        CancellationToken cancellationToken) =>
-        Task.FromResult(ImagePushResult.Success());
+        CancellationToken cancellationToken)
+    {
+        if (AspireServices is null || CurrentResource is null)
+        {
+            // No pipeline context — no-op (test / fallback).
+            return ImagePushResult.Success();
+        }
+
+#pragma warning disable ASPIREPIPELINES003 // IResourceContainerImageManager is [Experimental]; we deliberately depend on it for v1.x — see docs/aspire-image-builder-recon.md
+        var manager = AspireServices.GetService<IResourceContainerImageManager>();
+        if (manager is null)
+        {
+            return ImagePushResult.Success();
+        }
+
+        try
+        {
+            // The manager reads WithContainerRegistry / WithImagePushOptions and pushes
+            // to the configured registry. credentials are surfaced by Aspire through
+            // ContainerImagePushOptions and don't need to be re-passed here.
+            await manager.PushImageAsync(CurrentResource, cancellationToken).ConfigureAwait(false);
+            return ImagePushResult.Success();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex.Message.Contains("auth", StringComparison.OrdinalIgnoreCase)
+                                   || ex.Message.Contains("unauthor", StringComparison.OrdinalIgnoreCase))
+        {
+            return ImagePushResult.AuthRejected(ex.Message);
+        }
+        catch (Exception ex)
+        {
+            return ImagePushResult.Failed(ex.Message);
+        }
+#pragma warning restore ASPIREPIPELINES003
+    }
 }

@@ -1,14 +1,15 @@
 using Aspire.Hosting.ApplicationModel;
+using Aspire.Hosting.Publishing;
+using Microsoft.Extensions.DependencyInjection;
 
 // Implements ADR-005: Image registry strategy — explicit publisher-push to a developer-chosen registry (v1)
 namespace Aspire.Hosting.Coolify;
 
 /// <summary>
 /// FT-003 boundary onto Aspire's container-image build infrastructure (ADR-005 §3). The
-/// build phase composes a deterministic tag and delegates execution. The pipeline is owned
-/// by Aspire; this interface lets the publisher drive it once per resource without taking
-/// a direct dependency on Aspire's internal build API surface (which the eventual
-/// implementation wires through).
+/// build phase composes a deterministic tag and delegates execution. The pipeline is
+/// owned by Aspire; this interface lets the publisher drive it once per resource without
+/// taking a direct dependency on Aspire's internal build API surface.
 /// </summary>
 public interface IImageBuildPipeline
 {
@@ -29,14 +30,47 @@ public interface ILocalImageStore
     bool HasTag(string imageTag);
 }
 
+/// <summary>
+/// Default image-build pipeline: delegates to Aspire's canonical
+/// <see cref="IResourceContainerImageManager"/> (the same service the Azure Container Apps
+/// publisher uses — see docs/aspire-image-builder-recon.md §2). This gives us multi-arch,
+/// layer caching, build-arg / build-secret handling, and correct
+/// <c>WithContainerRegistry</c> propagation for free.
+///
+/// Falls back to a no-op when no <see cref="AspireServices"/> has been plumbed in (e.g.
+/// in unit tests that don't run the full pipeline) so the build phase still progresses.
+/// </summary>
 internal sealed class UnconfiguredImageBuildPipeline : IImageBuildPipeline
 {
-    // Smoke-test fallback: no-op succeed. FT-003 only spec'd the orchestration; the
-    // real Aspire-build integration (`dotnet publish /t:PublishContainer` + container
-    // image annotation reading) is a separate follow-up FT. Until it lands, the publisher
-    // records the computed tag and trusts a real image to exist at that tag — which
-    // holds for AddContainer(name, image) resources (Aspire already annotates the
-    // pre-existing image) but NOT for AddProject (needs real build glue).
-    public Task BuildAsync(IResource resource, string imageTag, CancellationToken cancellationToken) =>
-        Task.CompletedTask;
+    /// <summary>
+    /// Aspire's pipeline-step <see cref="IServiceProvider"/>. Set by
+    /// <see cref="CoolifyDeployingPublisher.RunPhaseAsync"/> at the top of every phase
+    /// invocation so this pipeline can resolve <see cref="IResourceContainerImageManager"/>.
+    /// </summary>
+    internal IServiceProvider? AspireServices { get; set; }
+
+    public async Task BuildAsync(IResource resource, string imageTag, CancellationToken cancellationToken)
+    {
+        if (AspireServices is null)
+        {
+            // Test / non-pipeline context: no-op succeed. The publisher records the
+            // computed tag so the deploy phase still tells Coolify the right image name.
+            return;
+        }
+
+#pragma warning disable ASPIREPIPELINES003 // IResourceContainerImageManager is [Experimental]; we deliberately depend on it for v1.x — see docs/aspire-image-builder-recon.md
+        var manager = AspireServices.GetService<IResourceContainerImageManager>();
+        if (manager is null)
+        {
+            // Aspire below 13.x or DI not yet bootstrapped — same no-op fallback as above.
+            return;
+        }
+
+        // The manager honours WithContainerRegistry / WithRemoteImageName / WithRemoteImageTag
+        // annotations on the resource (FT-014 wires WithContainerRegistry). The `imageTag`
+        // parameter we computed locally is informational only; the manager derives the
+        // final tag from the resource's annotations.
+        await manager.BuildImageAsync(resource, cancellationToken).ConfigureAwait(false);
+#pragma warning restore ASPIREPIPELINES003
+    }
 }

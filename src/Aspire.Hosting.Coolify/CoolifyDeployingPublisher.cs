@@ -423,6 +423,20 @@ public sealed class CoolifyDeployingPublisher
         var log = context.Logger;
         var name = phase.PhaseName();
 
+        // Plumb IServiceProvider into the default image-build/push pipelines so they can
+        // resolve Aspire's IResourceContainerImageManager (docs:
+        // /dotnet/api/aspire.hosting.publishing.iresourcecontainerimagemanager). Tests
+        // that have already overridden ImagePipeline / ImagePushPipeline with mocks
+        // are unaffected.
+        if (ImagePipeline is UnconfiguredImageBuildPipeline buildPipeline)
+        {
+            buildPipeline.AspireServices = context.Services;
+        }
+        if (ImagePushPipeline is UnconfiguredImagePushPipeline pushPipeline)
+        {
+            pushPipeline.AspireServices = context.Services;
+        }
+
         ct.ThrowIfCancellationRequested();
 
         log.LogInformation("coolify: {Phase}: enter", name);
@@ -1089,6 +1103,13 @@ public sealed class CoolifyDeployingPublisher
                     tag = $"{address}/{resource.Name}:{ver?.Trim()}";
                 }
 
+                // The default push pipeline routes through Aspire's IResourceContainerImageManager
+                // which pushes by IResource (not by tag string), so tell it which resource we're
+                // pushing in this step. Test-injected mocks ignore this property.
+                if (ImagePushPipeline is UnconfiguredImagePushPipeline upp)
+                {
+                    upp.CurrentResource = resource;
+                }
                 ImagePushResult result;
                 try
                 {
