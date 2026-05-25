@@ -267,22 +267,46 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                using var resp = await _c.SendRawAsync(
-                    HttpMethod.Get, $"api/v1/destinations/{Uri.EscapeDataString(name)}", body: null, ct)
+                // Coolify v4 (with the pksorensen/coolify#feat/api-destinations endpoints)
+                // exposes `GET /api/v1/destinations` returning a JSON array. There is no
+                // `/api/v1/destinations/{name}` form — the path param is the UUID. So we
+                // list all team-visible destinations and filter by `name` (or, as a
+                // convenience, accept that the caller may pass a UUID directly).
+                var list = await _c.SendForJsonAsync<List<DestinationListItem>>(
+                    HttpMethod.Get, "api/v1/destinations", body: null, ct)
                     .ConfigureAwait(false);
-                if (resp.IsSuccessStatusCode)
+
+                if (list is null || list.Count == 0)
                 {
-                    var found = await _c.ReadIdAsync(resp, ct).ConfigureAwait(false);
-                    return DestinationUpsertResult.Found(found ?? name);
+                    return DestinationUpsertResult.Failure(
+                        $"No destinations visible to this token. Create one in the Coolify UI under Server -> Destinations, then call WithCoolifyDestination(\"<name-or-uuid>\").");
                 }
-                return DestinationUpsertResult.Failure(
-                    $"Coolify returned HTTP {(int)resp.StatusCode} looking up destination.");
+
+                // Try by UUID first (caller may pass the literal UUID), then by name.
+                var match = list.FirstOrDefault(d => string.Equals(d.Uuid, name, StringComparison.OrdinalIgnoreCase))
+                    ?? list.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+
+                if (match is null)
+                {
+                    var available = string.Join(", ", list.Select(d => $"{d.Name} ({d.Uuid})"));
+                    return DestinationUpsertResult.Failure(
+                        $"Destination '{name}' not found. Available: {available}.");
+                }
+
+                return DestinationUpsertResult.Found(match.Uuid ?? name);
             }
             catch (OperationCanceledException) { throw; }
             catch (CoolifyAuthException ex) { return DestinationUpsertResult.Failure(ex.Message); }
             catch (CoolifyTransportException ex) { return DestinationUpsertResult.Failure(ex.Message); }
             catch (CoolifyUnparseableResponseException ex) { return DestinationUpsertResult.Failure(ex.Message); }
         }
+
+        private sealed record DestinationListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name,
+            [property: JsonPropertyName("network")] string? Network,
+            [property: JsonPropertyName("type")] string? Type,
+            [property: JsonPropertyName("server_uuid")] string? ServerUuid);
     }
 
     private sealed class HttpProjectsApi : IProjectsApi
