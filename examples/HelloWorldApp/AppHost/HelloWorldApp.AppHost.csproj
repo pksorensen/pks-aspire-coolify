@@ -6,6 +6,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <UserSecretsId>81f09ee6-1fee-4c10-9b11-113770263600</UserSecretsId>
+    <!-- AssemblyName drives the Coolify project name. Bump suffix to force a fresh
+         Coolify project on the IPv6-enabled destination so we can re-pentest cleanly. -->
+    <AssemblyName>HelloWorldApp.AppHost.V6</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>

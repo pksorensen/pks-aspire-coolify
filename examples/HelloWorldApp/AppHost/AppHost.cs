@@ -24,6 +24,6 @@ var api = builder.AddProject<Projects.HelloWorldApp_Api>("api")
 // Coolify publisher hook.
 builder
     .WithCoolifyDeploy(coolifyUrl, coolifyToken)
-    .WithCoolifyDestination("homelab");
+    .WithCoolifyDestination("homelab-v6");
 
 builder.Build().Run();

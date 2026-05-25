@@ -788,28 +788,38 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                         $"could not resolve or create Coolify project '{request.ApphostProjectName}'");
                 }
 
-                // 2. List existing applications and match by name for idempotency.
-                var existing = await _c.SendForJsonAsync<List<AppListItem>>(
-                    HttpMethod.Get, "api/v1/applications", body: null, ct).ConfigureAwait(false);
+                // 2. Ensure the target environment exists first so we can scope the existing-app
+                // lookup to (project, env). Coolify creates `production` asynchronously on
+                // project create — env upsert handles the race + returns the UUID we need.
+                var envResult = await _c.Environments
+                    .UpsertAsync(projectUuid, request.EnvironmentName, ct).ConfigureAwait(false);
+                if (envResult.Kind == UpsertKind.Failure || string.IsNullOrEmpty(envResult.Id))
+                {
+                    return new ApplicationProvisionResult(false, null, null, projectUuid, null,
+                        $"could not resolve Coolify environment '{request.EnvironmentName}' for project {projectUuid}: {envResult.ErrorMessage ?? "(no detail)"}");
+                }
 
-                string? appUuid = existing?
-                    .FirstOrDefault(a => string.Equals(a.Name, request.RegistryResourceName, StringComparison.OrdinalIgnoreCase))
-                    ?.Uuid;
+                // 3. List applications scoped to THIS project+env via the env-detail endpoint.
+                // Globally-listed /applications returns name collisions across projects (a
+                // sibling Coolify project's pks-registry-target was being returned when we
+                // moved to a new AppHost AssemblyName — see the 2026-05-25 V6 smoke run).
+                string? appUuid = null;
+                try
+                {
+                    var envDetail = await _c.SendForJsonAsync<EnvDetailBody>(
+                        HttpMethod.Get,
+                        $"api/v1/projects/{Uri.EscapeDataString(projectUuid)}/{Uri.EscapeDataString(envResult.Id!)}",
+                        body: null, ct).ConfigureAwait(false);
+                    appUuid = envDetail?.Applications?
+                        .FirstOrDefault(a => string.Equals(a.Name, request.RegistryResourceName, StringComparison.OrdinalIgnoreCase))
+                        ?.Uuid;
+                }
+                catch (CoolifyTransportException) { /* fall through; create path will run */ }
+                catch (CoolifyUnparseableResponseException) { /* fall through */ }
 
                 if (string.IsNullOrEmpty(appUuid))
                 {
-                    // 2b. Ensure the target environment exists (Coolify creates `production`
-                    // asynchronously when a project is created — the env upsert handles the race
-                    // and returns the UUID we need).
-                    var envResult = await _c.Environments
-                        .UpsertAsync(projectUuid, request.EnvironmentName, ct).ConfigureAwait(false);
-                    if (envResult.Kind == UpsertKind.Failure || string.IsNullOrEmpty(envResult.Id))
-                    {
-                        return new ApplicationProvisionResult(false, null, null, projectUuid, null,
-                            $"could not resolve Coolify environment '{request.EnvironmentName}' for project {projectUuid}: {envResult.ErrorMessage ?? "(no detail)"}");
-                    }
-
-                    // 3. Discover the single visible server.
+                    // 4. Discover the single visible server.
                     var servers = await _c.SendForJsonAsync<List<NamedUuid>>(
                         HttpMethod.Get, "api/v1/servers", body: null, ct).ConfigureAwait(false);
                     if (servers is null || servers.Count == 0)
@@ -1165,6 +1175,19 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
             [property: JsonPropertyName("name")] string? Name);
 
         private sealed record AppListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
+
+        // Shape returned by GET /api/v1/projects/{projectUuid}/{envUuid} — applications
+        // nested inside the environment view, scoped to (project, env) for collision-free
+        // idempotency lookups. ProvisionRegistryAsync uses this in place of the global
+        // /applications list which was project-blind.
+        private sealed record EnvDetailBody(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name,
+            [property: JsonPropertyName("applications")] List<EnvAppItem>? Applications);
+
+        private sealed record EnvAppItem(
             [property: JsonPropertyName("uuid")] string? Uuid,
             [property: JsonPropertyName("name")] string? Name);
 
