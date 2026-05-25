@@ -397,33 +397,45 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                // Coolify v4 GET is /api/v1/projects/{uuid}/{env_name_or_uuid} — NO /environments/
-                // segment (see routes/api.php in coollabsio/coolify). POST stays at
-                // /api/v1/projects/{uuid}/environments which is handled by the create branch below.
-                var path = $"api/v1/projects/{Uri.EscapeDataString(projectId)}/{Uri.EscapeDataString(name)}";
-                using var get = await _c.SendRawAsync(HttpMethod.Get, path, body: null, ct).ConfigureAwait(false);
-                if (get.IsSuccessStatusCode)
+                // Coolify v4 auto-creates a lowercase "production" environment on project
+                // creation, but Aspire deploys default to "Production" (capitalized).
+                // Coolify treats env names case-insensitively when creating (POST with
+                // "Production" against a project that already has "production" 500s).
+                // Strategy: list envs, do case-insensitive match against requested name,
+                // only POST if no match exists.
+                var envs = await _c.SendForJsonAsync<List<EnvironmentListItem>>(
+                    HttpMethod.Get,
+                    $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments",
+                    body: null, ct)
+                    .ConfigureAwait(false);
+
+                if (envs is not null)
                 {
-                    var id = await _c.ReadIdAsync(get, ct).ConfigureAwait(false) ?? name;
-                    return EnvironmentUpsertResult.Unchanged(id);
+                    var match = envs.FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase))
+                        ?? envs.FirstOrDefault(e => string.Equals(e.Uuid, name, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null)
+                    {
+                        return EnvironmentUpsertResult.Unchanged(match.Uuid ?? match.Name ?? name);
+                    }
                 }
-                if (get.StatusCode == HttpStatusCode.NotFound)
-                {
-                    var body = new NamedBody(name);
-                    var created = await _c.SendForJsonAsync<IdResponse>(
-                        HttpMethod.Post,
-                        $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments",
-                        body, ct).ConfigureAwait(false);
-                    return EnvironmentUpsertResult.Created(created?.Id ?? name);
-                }
-                return EnvironmentUpsertResult.Failure(
-                    $"Coolify returned HTTP {(int)get.StatusCode} fetching environment.");
+
+                // Not found — create it.
+                var body = new NamedBody(name);
+                var created = await _c.SendForJsonAsync<IdResponse>(
+                    HttpMethod.Post,
+                    $"api/v1/projects/{Uri.EscapeDataString(projectId)}/environments",
+                    body, ct).ConfigureAwait(false);
+                return EnvironmentUpsertResult.Created(created?.Id ?? name);
             }
             catch (OperationCanceledException) { throw; }
             catch (CoolifyAuthException ex) { return EnvironmentUpsertResult.Failure(ex.Message); }
             catch (CoolifyTransportException ex) { return EnvironmentUpsertResult.Failure(ex.Message); }
             catch (CoolifyUnparseableResponseException ex) { return EnvironmentUpsertResult.Failure(ex.Message); }
         }
+
+        private sealed record EnvironmentListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
     }
 
     private sealed class HttpServicesApi : IServicesApi
