@@ -363,29 +363,38 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                using var get = await _c.SendRawAsync(
-                    HttpMethod.Get, $"api/v1/projects/{Uri.EscapeDataString(name)}", body: null, ct)
+                // Coolify v4's GET /api/v1/projects/{name} actually expects a UUID, not a
+                // name — so the by-name GET always 404s and the old code POSTed a fresh
+                // project on every deploy, producing duplicates. List + filter by name (or
+                // uuid, in case the caller passed a UUID) instead.
+                var list = await _c.SendForJsonAsync<List<ProjectListItem>>(
+                    HttpMethod.Get, "api/v1/projects", body: null, ct)
                     .ConfigureAwait(false);
-                if (get.IsSuccessStatusCode)
+
+                if (list is not null)
                 {
-                    var id = await _c.ReadIdAsync(get, ct).ConfigureAwait(false) ?? name;
-                    return ProjectUpsertResult.Unchanged(id);
+                    var match = list.FirstOrDefault(p => string.Equals(p.Uuid, name, StringComparison.OrdinalIgnoreCase))
+                        ?? list.FirstOrDefault(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null && !string.IsNullOrEmpty(match.Uuid))
+                    {
+                        return ProjectUpsertResult.Unchanged(match.Uuid);
+                    }
                 }
-                if (get.StatusCode == HttpStatusCode.NotFound)
-                {
-                    var body = new NamedBody(name);
-                    var created = await _c.SendForJsonAsync<IdResponse>(
-                        HttpMethod.Post, "api/v1/projects", body, ct).ConfigureAwait(false);
-                    return ProjectUpsertResult.Created(created?.Id ?? name);
-                }
-                return ProjectUpsertResult.Failure(
-                    $"Coolify returned HTTP {(int)get.StatusCode} fetching project.");
+
+                var body = new NamedBody(name);
+                var created = await _c.SendForJsonAsync<IdResponse>(
+                    HttpMethod.Post, "api/v1/projects", body, ct).ConfigureAwait(false);
+                return ProjectUpsertResult.Created(created?.Id ?? name);
             }
             catch (OperationCanceledException) { throw; }
             catch (CoolifyAuthException ex) { return ProjectUpsertResult.Failure(ex.Message); }
             catch (CoolifyTransportException ex) { return ProjectUpsertResult.Failure(ex.Message); }
             catch (CoolifyUnparseableResponseException ex) { return ProjectUpsertResult.Failure(ex.Message); }
         }
+
+        private sealed record ProjectListItem(
+            [property: JsonPropertyName("uuid")] string? Uuid,
+            [property: JsonPropertyName("name")] string? Name);
     }
 
     private sealed class HttpEnvironmentsApi : IEnvironmentsApi
