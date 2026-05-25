@@ -1212,13 +1212,45 @@ public sealed class CoolifyDeployingPublisher
             }
 
             // FT-017 §A: plant REGISTRY_ADMIN_TOKEN env (random per-deploy) so the registry's
-            // /_mgmt/ surface is enabled. Pass any explicit env-vars declared on the registry
-            // container resource too (Aspire's EnvironmentCallbackAnnotation).
+            // /_mgmt/ surface is enabled. Pass any explicit env-vars declared on the registry's
+            // sidecar *container* resource too (Aspire's EnvironmentCallbackAnnotation lives on
+            // the container, not the ContainerRegistryResource target).
             var adminToken = RandomHex32();
             var envsToSet = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["REGISTRY_ADMIN_TOKEN"] = adminToken,
             };
+            // Locate the container resource sibling — it carries the same PksAgentRegistryAnnotation.
+            var siblingContainer = allResources
+                .OfType<ContainerResource>()
+                .FirstOrDefault(c =>
+                {
+                    var m = c.Annotations.OfType<PksAgentRegistryAnnotation>().FirstOrDefault();
+                    return m is not null && string.Equals(m.RegistryName, marker.RegistryName, StringComparison.Ordinal);
+                });
+            if (siblingContainer is not null)
+            {
+                try
+                {
+                    var envCtx = new EnvironmentCallbackContext(
+                        new DistributedApplicationExecutionContext(DistributedApplicationOperation.Publish),
+                        siblingContainer,
+                        new Dictionary<string, object>(),
+                        cancellationToken);
+                    foreach (var cb in siblingContainer.Annotations.OfType<EnvironmentCallbackAnnotation>())
+                    {
+                        await cb.Callback(envCtx).ConfigureAwait(false);
+                    }
+                    foreach (var kv in envCtx.EnvironmentVariables)
+                    {
+                        if (kv.Value is string sv && !string.IsNullOrEmpty(sv))
+                        {
+                            envsToSet[kv.Key] = sv;
+                        }
+                    }
+                }
+                catch { /* tolerable — admin-token + Coolify-default env are still planted */ }
+            }
             state.AdminToken = adminToken;
 
             try

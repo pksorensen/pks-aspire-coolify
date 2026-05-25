@@ -85,6 +85,10 @@ public static class PksAgentRegistryExtensions
             .WithHttpEndpoint(port: port, targetPort: DefaultPort, name: "http")
             .WithEnvironment("REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY", "/var/lib/registry")
             .WithEnvironment("REGISTRY_HTTP_ADDR", ":" + DefaultPort.ToString(System.Globalization.CultureInfo.InvariantCulture))
+            // FT-018: trust the docker bridge to do anonymous pulls. Writes still need
+            // owner basic-auth. See pks-agent-registry README → REGISTRY_TRUSTED_PROXY_CIDRS.
+            .WithEnvironment("REGISTRY_TRUSTED_PROXY_CIDRS",
+                "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8")
             .WithBindMount($"./.data/{name}", "/var/lib/registry")
             // FT-016: mark the container itself so the publisher's build/push/deploy phases skip
             // it (the prereq phase already deploys this registry to Coolify).
