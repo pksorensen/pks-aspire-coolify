@@ -1312,6 +1312,10 @@ public sealed class CoolifyDeployingPublisher
             }
             state.OwnerName = ownerName;
             state.OwnerPassword = ownerPwd;
+            // Re-anchor ResolvedFqdn to include the owner segment so the publisher's tag
+            // computation matches what Aspire's image manager actually pushes (push goes via
+            // the reflection-modified endpoint below — both must agree).
+            state.ResolvedFqdn = $"{fqdn}/{ownerName}";
 
             // FT-017 §D: rewrite the ContainerRegistryResource's private `_endpoint` field so
             // Aspire's IResourceContainerImageManager tags + pushes against the Coolify-assigned
@@ -1865,6 +1869,33 @@ public sealed class CoolifyDeployingPublisher
                     }
                 }
                 tag ??= ""; // No tag available — surface as failure detail via the upsert.
+
+                // FT-017: ask Aspire for the *actual* pushed remote image name so the deploy
+                // service-spec matches what we just pushed (publisher's locally-computed tag uses
+                // the AppHost version; Aspire's manager pushes with its own `aspire-deploy-{ts}`
+                // tag, so the two diverge without this lookup).
+                try
+                {
+                    var resourceExt = typeof(Aspire.Hosting.ApplicationModel.ContainerResource).Assembly
+                        .GetType("Aspire.Hosting.ApplicationModel.ResourceExtensions");
+                    var mi = resourceExt?.GetMethod("GetFullRemoteImageNameAsync",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (mi is not null)
+                    {
+                        var taskObj = mi.Invoke(null, new object?[] { resource, cancellationToken });
+                        if (taskObj is Task task)
+                        {
+                            await task.ConfigureAwait(false);
+                            var resultProp = task.GetType().GetProperty("Result");
+                            var remoteName = resultProp?.GetValue(task) as string;
+                            if (!string.IsNullOrEmpty(remoteName))
+                            {
+                                tag = remoteName;
+                            }
+                        }
+                    }
+                }
+                catch { /* fall back to publisher-computed tag */ }
 
                 // FT-014: derive registry reference from the workload's registry edge.
                 var workloadRegistry = ResolveRegistryFor(resource);

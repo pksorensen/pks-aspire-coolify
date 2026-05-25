@@ -494,6 +494,29 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                     var match = existing.FirstOrDefault(a => string.Equals(a.Name, resourceName, StringComparison.OrdinalIgnoreCase));
                     if (match is not null && !string.IsNullOrEmpty(match.Uuid))
                     {
+                        // FT-005 §"Managed-field set": image + tag are managed — PATCH the app so
+                        // a subsequent deploy uses the newly-pushed tag, not the stale value from
+                        // a prior aspire-deploy. Coolify's "unchanged" assumption only holds for
+                        // unmanaged fields.
+                        string newName = spec.Image, newTag = "latest";
+                        var sIdx2 = spec.Image.LastIndexOf('/');
+                        var cIdx2 = spec.Image.LastIndexOf(':');
+                        if (cIdx2 > sIdx2)
+                        {
+                            newName = spec.Image[..cIdx2];
+                            newTag = spec.Image[(cIdx2 + 1)..];
+                        }
+                        var patchBody = new DockerImagePatchBody(newName, newTag);
+                        using var patchResp = await _c.SendRawAsync(
+                            HttpMethod.Patch,
+                            $"api/v1/applications/{Uri.EscapeDataString(match.Uuid!)}",
+                            patchBody, ct).ConfigureAwait(false);
+                        if (!patchResp.IsSuccessStatusCode && patchResp.StatusCode != HttpStatusCode.NotModified)
+                        {
+                            var pd = await patchResp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                            return ServiceUpsertResult.Failure(
+                                $"Coolify returned HTTP {(int)patchResp.StatusCode} patching application image: {pd}");
+                        }
                         return ServiceUpsertResult.Unchanged(match.Uuid);
                     }
                 }
@@ -570,6 +593,10 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         private sealed record ServerListItem2(
             [property: JsonPropertyName("uuid")] string? Uuid,
             [property: JsonPropertyName("name")] string? Name);
+
+        private sealed record DockerImagePatchBody(
+            [property: JsonPropertyName("docker_registry_image_name")] string DockerRegistryImageName,
+            [property: JsonPropertyName("docker_registry_image_tag")] string DockerRegistryImageTag);
 
         private sealed record DockerImageAppBody(
             [property: JsonPropertyName("name")] string Name,

@@ -330,8 +330,9 @@ public sealed class PrereqPhaseExitCriteriaTests
         Assert.True(build.Succeeded);
 
         Assert.Equal(2, buildPipeline.Calls.Count);
-        Assert.Equal("reg.example.test/api:1.0.0", buildPipeline.Calls[0].Tag);
-        Assert.Equal("reg.example.test/worker:1.0.0", buildPipeline.Calls[1].Tag);
+        // FT-017: owner segment is folded into the resolved FQDN so tags include /aspire/.
+        Assert.Equal("reg.example.test/aspire/api:1.0.0", buildPipeline.Calls[0].Tag);
+        Assert.Equal("reg.example.test/aspire/worker:1.0.0", buildPipeline.Calls[1].Tag);
 
         // The push phase records its tags too.
         var pushPipeline = new RecordingPushPipeline();
@@ -340,8 +341,8 @@ public sealed class PrereqPhaseExitCriteriaTests
             new IResource[] { api, worker }, NullLogger.Instance, default);
         Assert.True(push.Succeeded);
         Assert.Equal(2, pushPipeline.Calls.Count);
-        Assert.Equal("reg.example.test/api:1.0.0", pushPipeline.Calls[0].Tag);
-        Assert.Equal("reg.example.test/worker:1.0.0", pushPipeline.Calls[1].Tag);
+        Assert.Equal("reg.example.test/aspire/api:1.0.0", pushPipeline.Calls[0].Tag);
+        Assert.Equal("reg.example.test/aspire/worker:1.0.0", pushPipeline.Calls[1].Tag);
         // No tag carries the stale placeholder `localhost:` address.
         Assert.DoesNotContain(pushPipeline.Calls, c => c.Tag.StartsWith("localhost:", StringComparison.Ordinal));
     }
@@ -505,7 +506,8 @@ public sealed class PrereqPhaseExitCriteriaTests
 
         Assert.True(outcome.Succeeded);
         var state = publisher.PrereqStateByRegistry["reg-target"];
-        Assert.Equal("custom.example.test", state.ResolvedFqdn);
+        // FT-017: owner segment is folded into ResolvedFqdn for tag computation.
+        Assert.Equal("custom.example.test/aspire", state.ResolvedFqdn);
         Assert.Equal("custom.example.test", state.PreSetDomain);
         // W_REGISTRY_FQDN_FALLBACK is on stderr.
         Assert.Contains("W_REGISTRY_FQDN_FALLBACK", stderr.ToString());
