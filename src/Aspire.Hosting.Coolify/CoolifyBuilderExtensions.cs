@@ -60,6 +60,13 @@ public static class CoolifyBuilderExtensions
             // Tests still substitute their own ICoolifyClientFactory by re-assigning
             // publisher.ClientFactory after registration (last-call-wins).
             ClientFactory = new HttpCoolifyClientFactory(),
+            // FT-009 wiring: capture the builder so the containerisability filter (run at end
+            // of configure) can enumerate the AppHost's actual resource graph. Without this
+            // the filter returns null, LastFilterSummary stays unset, and the deploy phase
+            // iterates zero resources — Coolify gets a project + env created and nothing
+            // else. Resolved lazily at filter-time so resources added after WithCoolifyDeploy()
+            // are still included.
+            AllResourcesProvider = () => builder.Resources,
         };
         s_registry.Add(builder, publisher);
 
