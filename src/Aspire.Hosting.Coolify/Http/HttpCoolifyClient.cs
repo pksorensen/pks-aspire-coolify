@@ -315,7 +315,7 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                 // 3. POST /api/v1/servers/{server_uuid}/destinations creates a new
                 //    StandaloneDocker destination. Network must match the regex
                 //    `[a-zA-Z0-9][a-zA-Z0-9._-]*`; we use the supplied `name` as the network.
-                var createBody = new DestinationCreateBody(network: name, type: "standalone");
+                var createBody = new DestinationCreateBody(Network: name, Type: "standalone");
                 using var createResp = await _c.SendRawAsync(
                     HttpMethod.Post,
                     $"api/v1/servers/{Uri.EscapeDataString(server.Uuid)}/destinations",
