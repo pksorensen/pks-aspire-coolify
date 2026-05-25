@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Coolify;
+using Aspire.Hosting.Coolify.Http;
 using Aspire.Hosting.Pipelines;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -51,11 +52,22 @@ public static class CoolifyBuilderExtensions
             return builder;
         }
 
-        var publisher = new CoolifyDeployingPublisher(url, token);
+        var publisher = new CoolifyDeployingPublisher(url, token)
+        {
+            // FT-013 §"DI wiring": once WithCoolifyDeploy has run, the publisher resolves the
+            // live HTTP-backed client instead of the NotConfiguredCoolifyClientFactory stub.
+            // Tests still substitute their own ICoolifyClientFactory by re-assigning
+            // publisher.ClientFactory after registration (last-call-wins).
+            ClientFactory = new HttpCoolifyClientFactory(),
+        };
         s_registry.Add(builder, publisher);
 
         // Register publisher in DI so phase bodies / tests can resolve it.
         builder.Services.AddSingleton(publisher);
+        // FT-013 §"DI wiring": expose the live factory through the DI container as well, so
+        // anything resolving ICoolifyClientFactory after WithCoolifyDeploy sees the real one
+        // (I-9: stub supersession is total).
+        builder.Services.AddSingleton<ICoolifyClientFactory>(publisher.ClientFactory);
 
         // Wire the five named phase steps into Aspire's deploy pipeline, chained in fixed order
         // per ADR-003 §1, §7. The last step is required by the well-known Deploy aggregator so
