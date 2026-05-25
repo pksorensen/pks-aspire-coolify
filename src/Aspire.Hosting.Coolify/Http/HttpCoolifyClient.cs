@@ -623,7 +623,8 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
         {
             try
             {
-                var path = $"api/v1/deploy-jobs/{Uri.EscapeDataString(handle)}";
+                // Coolify v4 deploy-status endpoint is /api/v1/deployments/{uuid}, not /deploy-jobs/.
+                var path = $"api/v1/deployments/{Uri.EscapeDataString(handle)}";
                 using var resp = await _c.SendRawAsync(HttpMethod.Get, path, body: null, ct).ConfigureAwait(false);
                 if (resp.StatusCode == HttpStatusCode.NotFound)
                 {
@@ -639,10 +640,10 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
                 var raw = dto?.Status?.ToLowerInvariant();
                 return raw switch
                 {
-                    "queued" => DeployJobStatusResult.Queued(raw),
+                    "queued" or "in_queue" => DeployJobStatusResult.Queued(raw),
                     "in_progress" or "running" => DeployJobStatusResult.InProgress(raw),
-                    "succeeded" or "success" or "ok" => DeployJobStatusResult.Succeeded(raw),
-                    "failed" or "failure" or "error" => DeployJobStatusResult.Failed(raw, dto?.Error),
+                    "succeeded" or "success" or "ok" or "finished" => DeployJobStatusResult.Succeeded(raw),
+                    "failed" or "failure" or "error" or "cancelled-by-user" => DeployJobStatusResult.Failed(raw, dto?.Error),
                     null => DeployJobStatusResult.Transient("missing status field"),
                     _ => DeployJobStatusResult.InProgress(raw),
                 };
@@ -1184,10 +1185,11 @@ internal sealed class HttpCoolifyClient : ICoolifyClient, IDisposable
 
     private sealed record IdResponse(
         [property: JsonPropertyName("id")] string? Id,
-        [property: JsonPropertyName("uuid")] string? Uuid)
+        [property: JsonPropertyName("uuid")] string? Uuid,
+        [property: JsonPropertyName("deployment_uuid")] string? DeploymentUuid)
     {
-        // Coolify uses either `id` or `uuid` depending on the endpoint; tolerate both.
-        public string? IdOrUuid => Id ?? Uuid;
+        // Coolify uses `id`, `uuid`, or `deployment_uuid` depending on the endpoint.
+        public string? IdOrUuid => Id ?? Uuid ?? DeploymentUuid;
     }
 
     private sealed record NamedBody([property: JsonPropertyName("name")] string Name);
